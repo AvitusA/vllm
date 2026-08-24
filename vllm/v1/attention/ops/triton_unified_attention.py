@@ -7,6 +7,7 @@
 #  - Chih-Chieh Yang <chih.chieh.yang@ibm.com>
 #  - Thomas Parnell <tpa@zurich.ibm.com>
 
+import os
 from typing import Any
 
 import torch
@@ -792,11 +793,12 @@ def _get_tile_size(
         # Gemma3: use 32 for decode (default is 16)
         return 32
 
-    # Default behavior
+    # Default behavior (tiles env-tunable for RDNA3 sweeps; defaults match upstream)
     if is_prefill:
-        return 32
+        return int(os.environ.get("VLLM_TRITON_TILE_PREFILL", "32"))
     # Note: tile size must be at least 32 for fp8 (element_size == 1).
-    return 16 if element_size >= 2 else 32
+    default_decode = 16 if element_size >= 2 else 32
+    return int(os.environ.get("VLLM_TRITON_TILE_DECODE", str(default_decode)))
 
 
 def unified_attention(
@@ -1044,8 +1046,13 @@ def unified_attention(
         or softmax_segm_output is None
         or softmax_segm_max is None
         or softmax_segm_expsum is None
-        or max_seqlen_q > 1
-        or num_seqs > seq_threshold_3D
+        # RDNA3 spec-verify fix: the 3D (split-KV) kernel is fully general over
+        # query blocks, so let small-qlen verify batches (speculative decoding,
+        # qlen <= 8) use it instead of the unsegmented 2D path, which serializes
+        # KV scans and collapses decode at deep context. Buffer rows are indexed
+        # by TOKEN, so capacity-check total tokens, not sequences.
+        or max_seqlen_q > 8
+        or q.shape[0] > seq_threshold_3D
         or is_batch_invariant
     )
 

@@ -7743,13 +7743,28 @@ class GPUModelRunner(
                 continue
             # Skip modules that don't need KV cache (eg encoder-only attention)
             if spec := attn_module.get_kv_cache_spec(self.vllm_config):
-                if isinstance(spec, AttentionSpec):
-                    backend = attn_module.get_attn_backend()
-                    # indexes_kv_by_block_stride() -> get_kv_cache_stride_order()
-                    # -> get_kv_cache_layout() needs the current vLLM config.
-                    with set_current_vllm_config(self.vllm_config):
-                        indexes = backend.indexes_kv_by_block_stride()
-                    spec = replace(spec, indexes_kv_by_block_stride=indexes)
+                # LOCAL REVERT of #45181 (commit 2cac89f9d) per-layer stamping.
+                #
+                # Upstream stamps backend identity into the frozen-dataclass
+                # AttentionSpec via `indexes_kv_by_block_stride`. That field is
+                # part of __eq__/__hash__, and _get_kv_cache_groups_uniform_page_size
+                # buckets layers by spec VALUE equality then sets
+                # group_size = min(bucket sizes). A single odd layer therefore
+                # collapses group_size to 1 -> one KV cache group, one attention
+                # group, and one _build_attn_group_metadata call PER LAYER.
+                #
+                # Measured on qwen3.8-27b (48 GDN + 17 full-attn incl. the MTP
+                # layer): 65 groups/step vs 5 on 0.23, so gdn_attn.build() runs
+                # 48x vs 3x, firing its ~9 unchanged .item() calls into 628-vs-39
+                # device syncs per step -> ~30% end-to-end loss on gfx1100.
+                #
+                # NOT reverting a deliberate upstream split: this is an emergent
+                # side effect of the pre-existing `FIXME(Chen)` group_size=min()
+                # fragility being fed a new singleton bucket.
+                # Safe here: we run no DFlash (mixed KV page sizes), no MLA, no
+                # DeepSeek-V4 packed layout and no KV connector -- the only
+                # consumers of the flag. Verify: the "Add N padding layers"
+                # warning REAPPEARS with this patch (it is absent at group_size=1).
                 kv_cache_spec[layer_name] = spec
 
         return kv_cache_spec

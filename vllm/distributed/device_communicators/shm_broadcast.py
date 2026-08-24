@@ -4,6 +4,7 @@ import functools
 import pickle
 import sys
 import threading
+import os
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -125,6 +126,25 @@ class SpinCondition:
         notify_address: str,
         busy_loop_s: float = 1,
     ):
+        # PROD PATCH 2026-08-23: make the busy-loop window tunable.
+        #
+        # Default is 1 FULL SECOND of spin-waiting before falling back to an
+        # idle socket poll. At TP=4 a decode step at 29k takes ~20 ms, so every
+        # participant is permanently inside the busy window: measured by py-spy,
+        # the engine core spends 58.5% of its SELF time in sched_yield inside
+        # _wait_for_response, and worker traces show 53% of the decode window in
+        # acquire_read (vs 12% on vLLM 0.19.1). Five processes spin instead of
+        # blocking, and that CPU burn contends with the threads feeding the GPU.
+        # Depth-proportional: longer steps => more accumulated spin, which is
+        # exactly the -31% @29k / -57% @180k curve.
+        #
+        # VLLM_SHM_BUSY_LOOP_S=0 makes readers block on the socket immediately.
+        # NOTE: test for truthiness, not `is not None` -- the launcher passes an
+        # EMPTY string when the knob is unset, and float("") raises ValueError
+        # which kills the engine core at startup.
+        _env = os.environ.get("VLLM_SHM_BUSY_LOOP_S")
+        if _env:
+            busy_loop_s = float(_env)
         self.is_reader = is_reader
 
         if is_reader:

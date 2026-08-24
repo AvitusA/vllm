@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """High-Performance Triton-only Attention layer."""
 
+import os
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -52,8 +53,9 @@ logger = init_logger(__name__)
 
 
 # constants
-MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
-NUM_PAR_SOFTMAX_SEGMENTS = 16  # Number of parallel tiled softmax segments
+# env-tunable for RDNA3 sweeps (defaults match upstream)
+MIN_LAUNCH_GRID_SIZE_2D = int(os.environ.get("VLLM_TRITON_MIN_GRID_2D", "128"))
+NUM_PAR_SOFTMAX_SEGMENTS = int(os.environ.get("VLLM_TRITON_SOFTMAX_SEGMENTS", "16"))
 
 
 @dataclass
