@@ -128,11 +128,15 @@ class DraftModelSpeculator(BaseSpeculator):
 
         self.draft_logits: torch.Tensor | None = None
         if self.speculative_config.draft_sample_method == "probabilistic":
-            self.draft_logits = torch.zeros(
-                self.max_num_reqs,
-                self.num_speculative_steps,
-                self.vocab_size,
-                dtype=torch.float32,
+            dtype, fill = self.draft_logits_spec(vllm_config)
+            self.draft_logits = torch.full(
+                (
+                    self.max_num_reqs,
+                    self.num_speculative_steps,
+                    self.vocab_size,
+                ),
+                fill,
+                dtype=dtype,
                 device=device,
             )
 
@@ -241,6 +245,19 @@ class DraftModelSpeculator(BaseSpeculator):
             causal=causal,
         )
         return attn_metadata
+
+    def draft_logits_spec(self, vllm_config: VllmConfig) -> tuple[torch.dtype, float]:
+        """Dtype and fill for the cached proposal distribution.
+
+        Speculators that write only a subset of columns each step override this.
+
+        NOTE(local): upstream returns model_config.head_dtype here, but 0.26
+        allocated this buffer as float32. Returning head_dtype would silently
+        switch MTP's cached proposal distribution to fp16, which is a behaviour
+        change we did not ask for. Kept as float32 to preserve 0.26 exactly.
+        DEVIATION FROM UPSTREAM -- re-check when rebasing.
+        """
+        return torch.float32, 0.0
 
     def _validate_local_argmax_reduction(self) -> None:
         if not self.use_local_argmax_reduction:
