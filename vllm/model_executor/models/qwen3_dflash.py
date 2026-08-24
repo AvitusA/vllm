@@ -509,6 +509,9 @@ class DFlashQwen3Model(nn.Module):
         head_dim: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # --- Fused KV projection (one GEMM for all layers) ---
+        # The speculator's hidden_states buffer is allocated at the TARGET's
+        # dtype, so under a bf16 draft this arrives fp16. No-op if they match.
+        context_states = context_states.to(self._hidden_norm_weight.dtype)
         normed_context_states = torch.empty_like(context_states)
         ops.rms_norm(
             normed_context_states,
@@ -625,7 +628,10 @@ class DFlashQwen3Model(nn.Module):
         if input_embeds is None:
             input_embeds = self.embed_input_ids(input_ids)
 
-        hidden_states = input_embeds
+        # The drafter SHARES the target's embedding table (load_dflash_model
+        # rebinds embed_tokens), so under a bf16 draft these arrive at the
+        # target's dtype. No-op when they match.
+        hidden_states = input_embeds.to(self.norm.weight.dtype)
 
         residual = None
         for layer in self.layers:
@@ -764,7 +770,14 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
                 "means the draft model's target_layer_ids reference layers that "
                 "do not exist in the target model (incompatible draft/target pair)."
             )
-        result = self.model.fc(hidden_states)
+        # Aux hidden states come from the TARGET, so under a bf16 draft they
+        # arrive fp16 against a bf16 `fc`. This is the guard vLLM #40334 proposed
+        # and upstream closed without merging; ROCm hits it even same-dtype
+        # (#42588). No-op when the dtypes already match.
+        out_dtype = hidden_states.dtype
+        result = self.model.fc(hidden_states.to(self.model.fc.weight.dtype)).to(
+            out_dtype
+        )
         if needs_squeeze:
             result = result.squeeze(0)
         return result

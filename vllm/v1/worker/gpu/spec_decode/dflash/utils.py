@@ -36,6 +36,13 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
             else vllm_config.cache_config
         ),
     )
+    if __import__("os").environ.get("DF2_DRAFT_BF16", "0") == "1":
+        # get_model() passes draft_model_config to the LOADER, but the draft
+        # model's __init__ reads get_current_vllm_config().model_config, which is
+        # still the TARGET's -- so fc, mask_embedding and the DFlash2 candidate
+        # selector would be built at the target's dtype and tear against bf16
+        # weights. Make the draft's config the current one.
+        draft_vllm_config = replace(draft_vllm_config, model_config=draft_model_config)
     with set_model_tag("dflash_head"):
         dflash_model = get_model(
             vllm_config=draft_vllm_config, model_config=draft_model_config

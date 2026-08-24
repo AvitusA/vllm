@@ -282,8 +282,13 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
     def compute_candidates(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # This runs the DRAFTER's hidden states through the TARGET's lm_head, so
+        # a bf16 draft under an fp16 target meets an fp16 head here. Post-norm
+        # values are O(10), so the cast is lossless; no-op when dtypes match.
         return self.candidate_logits_processor.get_top_k_tokens(
-            self.lm_head, hidden_states, self.model.candidate_selector.top_k
+            self.lm_head,
+            hidden_states.to(self.lm_head.weight.dtype),
+            self.model.candidate_selector.top_k,
         )
 
 

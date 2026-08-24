@@ -840,7 +840,16 @@ class SpeculativeConfig:
                     trust_remote_code=self.target_model_config.trust_remote_code,
                     allowed_local_media_path=self.target_model_config.allowed_local_media_path,
                     allowed_media_domains=self.target_model_config.allowed_media_domains,
-                    dtype=self.target_model_config.dtype,
+                    # DF2_DRAFT_BF16=1 runs the DRAFT in bfloat16 under an fp16
+                    # target. Measured on gfx1100: this drafter's residual stream
+                    # reaches 1.6e5 and its layer outputs 8.7e4, both past fp16's
+                    # 65504, so an fp16 draft is all-NaN (0.08% acceptance) while
+                    # bf16 gives ~45%. Exponent RANGE, not precision.
+                    dtype=(
+                        "bfloat16"
+                        if __import__("os").environ.get("DF2_DRAFT_BF16", "0") == "1"
+                        else self.target_model_config.dtype
+                    ),
                     seed=self.target_model_config.seed,
                     revision=self.revision,
                     code_revision=self.code_revision,
