@@ -36,9 +36,31 @@ def apply() -> None:
     orig_mapper = cfg_cls.apply_vllm_mapper
     orig_gqm = cfg_cls.get_quant_method
 
+    def _index_params_metadata(model_name, revision):
+        # The model dir may hold extra safetensors (e.g. symlinked PLE-table
+        # shards that also carry stale copies of side tensors). The index
+        # defines the model; a dir glob lets an overlay's bf16 copy shadow
+        # the real fp8 entry via dict overwrite.
+        import json as _json
+        import os as _os
+
+        idx = _os.path.join(model_name, "model.safetensors.index.json")
+        if not (_os.path.isdir(model_name) and _os.path.isfile(idx)):
+            return get_safetensors_params_metadata(model_name, revision=revision)
+        from pathlib import Path
+
+        from vllm.transformers_utils.config import parse_safetensors_file_metadata
+
+        with open(idx) as f:
+            files = sorted(set(_json.load(f)["weight_map"].values()))
+        md = {}
+        for fn in files:
+            md.update(parse_safetensors_file_metadata(Path(model_name) / fn))
+        return md
+
     def maybe_update_config(self, model_name, hf_config=None, revision=None):
         orig_update(self, model_name, hf_config=hf_config, revision=revision)
-        md = get_safetensors_params_metadata(model_name, revision=revision)
+        md = _index_params_metadata(model_name, revision)
         self.fp8_layers = {
             name[: -len(".weight")]
             for name, info in md.items()
@@ -63,20 +85,9 @@ def apply() -> None:
         head, _, proj = prefix.rpartition(".")
         fused = self.packed_modules_mapping.get(proj)
         names = [f"{head}.{p}" for p in fused] if fused and head else [prefix]
-        hit = all(any(l in n for l in fp8_layers) for n in names)
-        if not hit and ("linear_attn" in prefix or "self_attn" in prefix):
-            logger.warning(
-                "fp8 hybrid MISS: prefix=%r names=%r n_fp8=%d sample_fp8=%r",
-                prefix, names, len(fp8_layers), sorted(fp8_layers)[:3],
-            )
-        return hit
+        return all(any(l in n for l in fp8_layers) for n in names)
 
     def get_quant_method(self, layer, prefix):
-        if "in_proj_qkvz" in prefix:
-            logger.warning(
-                "fp8 hybrid DISPATCH: prefix=%r linear=%s fp8=%s",
-                prefix, isinstance(layer, LinearBase), self._is_fp8_layer(prefix),
-            )
         if isinstance(layer, LinearBase) and self._is_fp8_layer(prefix):
             fp8_cfg = getattr(self, "_fp8_cfg", None)
             if fp8_cfg is None:
