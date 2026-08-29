@@ -36,7 +36,7 @@ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from ..common.ple import copy_ple_embedding_shard_
 from ..nvidia import ple_mmap
 
-_QUALIFIED_AMD_PLE_OP_NAME = "vllm::qwen4_exp_amd_ple_ngram_embedding"
+_QUALIFIED_AMD_PLE_OP_NAME = "vllm::qwen4_exp_amd_ple_mmap_forward"
 
 _MASK64 = (1 << 64) - 1
 _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
@@ -265,7 +265,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         valid = (source.unsqueeze(0) >= 0) & (position_in_segment >= shift)
         return torch.where(valid, shifted, tokens.new_full((), eos_token_id))
 
-    def forward(
+    def _hash_ngram_ids(
         self,
         input_ids: torch.Tensor,
         query_start_loc: torch.Tensor,
@@ -328,15 +328,33 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             offsets = self.ngram_heads_offsets[start:end]
             ids = torch.remainder(mixed.unsqueeze(-1), sizes) + offsets
             id_blocks.append(ids[request_indices, adjusted_columns])
-        ngram_ids = torch.cat(id_blocks, dim=-1)
-        output_dtype = (
-            self.ngram_embedding.torch_dtype
-            if isinstance(self.ngram_embedding, ple_mmap.MmapNgramEmbedding)
-            else self.ngram_embedding.params_dtype
-        )
+        return torch.cat(id_blocks, dim=-1)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        ngram_context: torch.Tensor,
+    ) -> torch.Tensor:
+        if isinstance(self.ngram_embedding, ple_mmap.MmapNgramEmbedding):
+            # Widen the eager-op boundary to the WHOLE forward, like the
+            # nvidia mmap path: under piecewise capture the preceding graph
+            # piece is recorded, not executed, so a pre-hashed ngram_ids
+            # tensor holds garbage — only the persistent input buffers are
+            # valid. Hashing must run inside the op, from input_ids.
+            num_tokens = input_ids.reshape(-1).shape[0]
+            output = input_ids.new_empty(
+                (num_tokens, self.embedding_dim),
+                dtype=self.ngram_embedding.torch_dtype,
+            )
+            torch.ops.vllm.qwen4_exp_amd_ple_mmap_forward(
+                input_ids, query_start_loc, ngram_context, output, self.layer_name
+            )
+            return output
+        ngram_ids = self._hash_ngram_ids(input_ids, query_start_loc, ngram_context)
         output = ngram_ids.new_empty(
             (ngram_ids.shape[0], self.embedding_dim),
-            dtype=output_dtype,
+            dtype=self.ngram_embedding.params_dtype,
         )
         torch.ops.vllm.qwen4_exp_amd_ple_ngram_embedding(
             ngram_ids,
@@ -1100,6 +1118,41 @@ def qwen4_exp_amd_ple_ngram_embedding_fake(
     return
 
 
+def qwen4_exp_amd_ple_mmap_forward(
+    input_ids: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    ngram_context: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    """Whole-forward eager op for the mmap PLE path: hash + disk gather.
+
+    The hashing must run inside the op (from the persistent input buffers),
+    not in the surrounding graph piece — under piecewise capture that piece
+    is recorded without execution, so any pre-hashed ids tensor holds
+    garbage and would index the mmap table out of range.
+    """
+    layer = get_forward_context().no_compile_layers[layer_name]
+    if not isinstance(layer, Qwen4ExpPLELayer):
+        raise TypeError(f"{layer_name} is not a Qwen4Exp PLE owner")
+    ple_embedding = layer.ple_embedding
+    ngram_ids = ple_embedding._hash_ngram_ids(
+        input_ids, query_start_loc, ngram_context
+    )
+    result = ple_embedding.ngram_embedding(ngram_ids).flatten(-2)
+    output.copy_(result)
+
+
+def qwen4_exp_amd_ple_mmap_forward_fake(
+    input_ids: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    ngram_context: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    return
+
+
 def qwen4_exp_ple_short_conv(
     inputs: torch.Tensor,
     output: torch.Tensor,
@@ -1123,6 +1176,14 @@ direct_register_custom_op(
     op_func=qwen4_exp_amd_ple_ngram_embedding,
     mutates_args=["output"],
     fake_impl=qwen4_exp_amd_ple_ngram_embedding_fake,
+)
+
+
+direct_register_custom_op(
+    op_name="qwen4_exp_amd_ple_mmap_forward",
+    op_func=qwen4_exp_amd_ple_mmap_forward,
+    mutates_args=["output"],
+    fake_impl=qwen4_exp_amd_ple_mmap_forward_fake,
 )
 
 
