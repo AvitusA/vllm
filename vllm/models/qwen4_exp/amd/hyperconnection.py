@@ -67,6 +67,7 @@ class GatedResidual(nn.Module):
         config: HyperConnectionConfig,
         use_combine: bool = True,
         prefix: str = "",
+        quant_config=None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -119,7 +120,7 @@ class GatedResidual(nn.Module):
             self.hyper_hidden_size,
             bias=False,
             params_dtype=config.params_dtype,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=maybe_prefix(prefix, "input_mix_weight_up"),
             return_bias=False,
         )
