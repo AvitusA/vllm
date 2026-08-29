@@ -1058,6 +1058,26 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             conv_weights.to(dtype=inputs.dtype),
         )
 
+    def _get_embedding_weight_scale(self) -> torch.Tensor | None:
+        embedding = getattr(self.ple_embedding, "ngram_embedding", None)
+        return getattr(embedding, "weight_scale", None)
+
+    def _dequantize_embeddings(
+        self,
+        embeddings: torch.Tensor,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Dequantize PLE lookup output (fp8 mmap tables carry a global scale)."""
+
+        if embeddings.dtype != torch.float8_e4m3fn:
+            return embeddings.to(output_dtype)
+        weight_scale = self._get_embedding_weight_scale()
+        if weight_scale is None:
+            raise RuntimeError("FP8 PLE embedding is missing its global scale")
+        return embeddings.to(output_dtype) * weight_scale.to(
+            device=embeddings.device, dtype=output_dtype
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1073,6 +1093,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                 f"{hidden_states.shape[0]}"
             )
         embeddings = self.ple_embedding(input_ids, query_start_loc, ngram_context)
+        embeddings = self._dequantize_embeddings(embeddings, hidden_states.dtype)
         key, _ = self.key_proj(embeddings)
         value, _ = self.value_proj(embeddings)
         token_count = hidden_states.shape[0]

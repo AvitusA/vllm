@@ -861,3 +861,11 @@ class AutoGPTQMoEMethod(FusedMoEMethodBase):
             e_score_correction_bias=layer.e_score_correction_bias,
             routed_scaling_factor=layer.routed_scaling_factor,
         )
+
+
+# Opt-in hybrid GPTQ+blockwise-fp8 dispatch (VLLM_FP8_HYBRID=1); see module.
+from vllm.model_executor.layers.quantization.fp8_hybrid_patch import (  # noqa: E402
+    apply as _apply_fp8_hybrid,
+)
+
+_apply_fp8_hybrid()
