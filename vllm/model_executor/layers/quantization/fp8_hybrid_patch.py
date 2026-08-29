@@ -63,7 +63,14 @@ def apply() -> None:
         head, _, proj = prefix.rpartition(".")
         fused = self.packed_modules_mapping.get(proj)
         names = [f"{head}.{p}" for p in fused] if fused and head else [prefix]
-        return all(any(l in n for l in fp8_layers) for n in names)
+        hit = all(any(l in n for l in fp8_layers) for n in names)
+        if not hit and ("linear_attn" in prefix or "self_attn" in prefix):
+            sample = sorted(l for l in fp8_layers if ".layers.10." in l)[:4]
+            logger.warning(
+                "fp8 hybrid MISS: prefix=%r names=%r sample_fp8=%r",
+                prefix, names, sample,
+            )
+        return hit
 
     def get_quant_method(self, layer, prefix):
         if isinstance(layer, LinearBase) and self._is_fp8_layer(prefix):
