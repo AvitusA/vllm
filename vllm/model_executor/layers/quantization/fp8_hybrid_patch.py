@@ -65,10 +65,9 @@ def apply() -> None:
         names = [f"{head}.{p}" for p in fused] if fused and head else [prefix]
         hit = all(any(l in n for l in fp8_layers) for n in names)
         if not hit and ("linear_attn" in prefix or "self_attn" in prefix):
-            sample = sorted(l for l in fp8_layers if ".layers.10." in l)[:4]
             logger.warning(
-                "fp8 hybrid MISS: prefix=%r names=%r sample_fp8=%r",
-                prefix, names, sample,
+                "fp8 hybrid MISS: prefix=%r names=%r n_fp8=%d sample_fp8=%r",
+                prefix, names, len(fp8_layers), sorted(fp8_layers)[:3],
             )
         return hit
 
