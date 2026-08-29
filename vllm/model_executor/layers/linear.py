@@ -964,6 +964,13 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 param = getattr(self, name, self)
             if param is None and name == "bias":
                 continue
+            if param is self:
+                raise ValueError(
+                    f"{type(self).__name__} {getattr(self, 'prefix', '?')}: no "
+                    f"parameter matches checkpoint tensor {name!r} "
+                    f"(shard_id={shard_id!r}); params: "
+                    f"{[n for n, _ in self.named_parameters()]}"
+                )
             param.weight_loader(param, loaded_weight, shard_id)
             logger.debug(
                 "Loaded shard %s with shape %s into %s.%s",
@@ -1318,6 +1325,13 @@ class QKVParallelLinear(ColumnParallelLinear):
                 param = getattr(self, name, self)
             if param is None and name == "bias":
                 continue
+            if param is self:
+                raise ValueError(
+                    f"{type(self).__name__} {getattr(self, 'prefix', '?')}: no "
+                    f"parameter matches checkpoint tensor {name!r} "
+                    f"(shard_id={shard_id!r}); params: "
+                    f"{[n for n, _ in self.named_parameters()]}"
+                )
             param.weight_loader(param, loaded_weight, shard_id)
             logger.debug(
                 "Loaded shard %s with shape %s into %s.%s",
