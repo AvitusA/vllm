@@ -72,6 +72,11 @@ def apply() -> None:
         return hit
 
     def get_quant_method(self, layer, prefix):
+        if "in_proj_qkvz" in prefix:
+            logger.warning(
+                "fp8 hybrid DISPATCH: prefix=%r linear=%s fp8=%s",
+                prefix, isinstance(layer, LinearBase), self._is_fp8_layer(prefix),
+            )
         if isinstance(layer, LinearBase) and self._is_fp8_layer(prefix):
             fp8_cfg = getattr(self, "_fp8_cfg", None)
             if fp8_cfg is None:
