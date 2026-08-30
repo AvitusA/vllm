@@ -92,27 +92,28 @@ class GatedResidual(nn.Module):
         # -- vLLM Linear weights --------------------------------------------
         # The merged skinny-GEMM shape is physically padded to 16 rows for
         # alignment and efficient backend dispatch.
-        self.pad_size = (-(self.lora_rank + self.hc_count)) % 16 if use_combine else 0
+        # down and block_inject used to be one fused MergedColumnParallelLinear
+        # (disable_tp); split so `down` can quantize (int8, unsloth-Q8-blessed)
+        # while the tiny gating `inject` stays bf16 — a fused module cannot
+        # mix quant methods.
+        self.pad_size = 0
+        self.input_mix_weight_down = ReplicatedLinear(
+            self.hyper_hidden_size,
+            self.lora_rank,
+            bias=False,
+            params_dtype=config.params_dtype,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "input_mix_weight_down"),
+            return_bias=False,
+        )
         if use_combine:
-            self.input_mix_weight_down_block_inject = MergedColumnParallelLinear(
+            self.block_inject_weight = ReplicatedLinear(
                 self.hyper_hidden_size,
-                [self.lora_rank, self.hc_count]
-                + ([self.pad_size] if self.pad_size else []),
+                self.hc_count,
                 bias=False,
                 params_dtype=config.params_dtype,
                 quant_config=None,
-                prefix=maybe_prefix(prefix, "input_mix_weight_down_block_inject"),
-                return_bias=False,
-                disable_tp=True,
-            )
-        else:
-            self.input_mix_weight_down = ReplicatedLinear(
-                self.hyper_hidden_size,
-                self.lora_rank,
-                bias=False,
-                params_dtype=config.params_dtype,
-                quant_config=None,
-                prefix=maybe_prefix(prefix, "input_mix_weight_down"),
+                prefix=maybe_prefix(prefix, "block_inject_weight"),
                 return_bias=False,
             )
         self.input_mix_weight_up = ReplicatedLinear(
@@ -135,14 +136,8 @@ class GatedResidual(nn.Module):
             self.hc_count,
         )
 
-        if self.use_combine:
-            # produce injection logits for combine
-            split_sizes = [self.lora_rank, self.hc_count, self.pad_size]
-            down_and_injection = self.input_mix_weight_down_block_inject(xn)
-            lora, injection, _ = down_and_injection.split(split_sizes, dim=-1)
-        else:
-            lora = self.input_mix_weight_down(xn)
-            injection = None
+        lora = self.input_mix_weight_down(xn)
+        injection = self.block_inject_weight(xn) if self.use_combine else None
 
         lora = hc_silu(lora, self.hc_count)
         gate = self.input_mix_weight_up(lora)  # [M, D]
@@ -171,14 +166,8 @@ class GatedResidual(nn.Module):
             self.hc_count,
         )
 
-        if self.use_combine:
-            # produce injection logits for combine
-            split_sizes = [self.lora_rank, self.hc_count, self.pad_size]
-            down_and_injection = self.input_mix_weight_down_block_inject(xn)
-            lora, injection, _ = down_and_injection.split(split_sizes, dim=-1)
-        else:
-            lora = self.input_mix_weight_down(xn)
-            injection = None
+        lora = self.input_mix_weight_down(xn)
+        injection = self.block_inject_weight(xn) if self.use_combine else None
 
         lora = hc_silu(lora, self.hc_count)
         gate = self.input_mix_weight_up(lora)  # [M, D]

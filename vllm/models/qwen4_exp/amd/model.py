@@ -141,18 +141,9 @@ _QWEN4_EXP_IGNORED_MISSING_SUFFIXES = [
 
 # The checkpoint keeps down and injection projections separate; runtime packs
 # them into adjacent logical shards of one MergedColumnParallelLinear.
-_HC_WEIGHTS_MAPPER = WeightsMapper(
-    orig_to_new_stacked={
-        "hyper_connection.input_mix_weight_down.weight": (
-            "hyper_connection.input_mix_weight_down_block_inject.weight",
-            0,
-        ),
-        "hyper_connection.block_inject_weight.weight": (
-            "hyper_connection.input_mix_weight_down_block_inject.weight",
-            1,
-        ),
-    }
-)
+# down/inject are separate modules again (see hyperconnection.py) — the
+# checkpoint names map 1:1, no stacking needed.
+_HC_WEIGHTS_MAPPER = WeightsMapper()
 
 
 class Qwen4ExpSparseMoeBlock(Qwen3NextSparseMoeBlock):
