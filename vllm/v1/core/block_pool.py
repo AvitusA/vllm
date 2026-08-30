@@ -232,6 +232,11 @@ class BlockPool:
         kv_cache_group_id: int,
         block_mask: list[bool] | None = None,
     ) -> None:
+        logger.info(
+            "PUBDBG group=%d bs=%d cached=%d full=%d masked=%s",
+            kv_cache_group_id, block_size, num_cached_blocks, num_full_blocks,
+            None if block_mask is None else sum(block_mask),
+        )
         """Cache a list of full blocks for prefix caching.
         This function takes a list of blocks that will have their block hash
         metadata to be updated and cached. Given a request, it updates the
