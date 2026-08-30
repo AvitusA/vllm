@@ -21,6 +21,7 @@ from torch import nn
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig, replace, set_current_vllm_config
+from vllm.logger import init_logger
 from vllm.distributed import get_pp_group
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import ColumnParallelLinear
@@ -55,6 +56,8 @@ from .model import (
     Qwen4ExpMixtureOfExperts,
 )
 
+
+logger = init_logger(__name__)
 
 def _remap_ignored_layers(
     ignored_layers: list[str],
@@ -117,6 +120,20 @@ def _make_draft_vllm_config(
 
     # inject packed and ignored modules to the quantization config of draft model
     if draft_quant_config is not None:
+        # The target's config gets modules_in_block_to_quantize populated from
+        # checkpoint metadata via maybe_update_config; the re-derived draft
+        # config never runs it, so every draft linear fails the
+        # is_layer_gptq_quantized membership check and initializes
+        # unquantized regardless of dynamic rules.
+        draft_quant_config.maybe_update_config(
+            speculative_config.draft_model_config.model
+        )
+        mibq = getattr(draft_quant_config, "modules_in_block_to_quantize", None)
+        logger.info(
+            "draft quant modules_in_block: n=%s sample=%s",
+            len(mibq) if mibq else 0,
+            sorted(m for m in (mibq or []) if m.startswith("mtp."))[:3],
+        )
         configure_quant_config(draft_quant_config, Qwen4ExpMTP)
         # The draft config re-derivation drops GPTQ `dynamic` rules; without
         # them the draft ignores both per-layer overrides and exclusions
