@@ -408,7 +408,15 @@ class Scheduler(SchedulerInterface):
         if start >= prefill_end:
             return num_new_tokens
 
-        block_size = self.cache_config.block_size
+        # cache_config.block_size is the MINIMUM across KV cache groups (the
+        # fine/draft granularity), but this function's whole job is to end
+        # chunks at MAMBA state boundaries. With the fine size, chunk ends
+        # land where no mamba state is cacheable, a cold request publishes no
+        # reusable state, and the min-across-groups hit rule makes the next
+        # identical request a full miss.
+        block_size = (
+            self.cache_config.mamba_block_size or self.cache_config.block_size
+        )
         # The last block-aligned position whose state can be cached. With
         # Eagle, FullAttn prunes the last matching block, so back off one
         # block to avoid a Mamba cache miss.
