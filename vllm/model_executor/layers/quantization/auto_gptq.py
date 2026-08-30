@@ -243,6 +243,12 @@ class AutoGPTQConfig(QuantizationConfig):
         if isinstance(layer, RoutedExperts):
             from vllm.model_executor.layers.quantization.moe_wna16 import MoeWNA16Config
 
+            # Dynamic '-' exclusions must apply before the marlin/WNA16
+            # dispatch, or excluded experts (e.g. a bf16 MTP sidecar)
+            # get quantized-init unconditionally on non-marlin platforms.
+            if get_dynamic_override(self, layer_name=prefix) == False:  # noqa: E712
+                return UnquantizedFusedMoEMethod(layer.moe_config)
+
             if not check_moe_marlin_supports_layer(
                 layer, self.group_size, allow_tile_padding=not self.desc_act
             ):
