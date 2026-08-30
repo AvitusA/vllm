@@ -118,6 +118,14 @@ def _make_draft_vllm_config(
     # inject packed and ignored modules to the quantization config of draft model
     if draft_quant_config is not None:
         configure_quant_config(draft_quant_config, Qwen4ExpMTP)
+        # The draft config re-derivation drops GPTQ `dynamic` rules; without
+        # them the draft ignores both per-layer overrides and exclusions
+        # (e.g. a bf16 MTP sidecar gets quantized-init experts). Carry the
+        # target's rules over verbatim — they match by prefix regex, so
+        # 'mtp.'-scoped exclusions apply to the draft's own module names.
+        target_dynamic = getattr(vllm_config.quant_config, "dynamic", None)
+        if target_dynamic and not getattr(draft_quant_config, "dynamic", None):
+            draft_quant_config.dynamic = target_dynamic
         ignored_layers = getattr(draft_quant_config, "ignored_layers", None)
         if ignored_layers:
             setattr(  # noqa: B010
