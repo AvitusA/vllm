@@ -417,6 +417,13 @@ class Scheduler(SchedulerInterface):
         block_size = (
             self.cache_config.mamba_block_size or self.cache_config.block_size
         )
+        logger.warning_once(
+            "mamba_aligned_split sizes: block_size=%s mamba_block_size=%s "
+            "use_eagle=%s",
+            self.cache_config.block_size,
+            self.cache_config.mamba_block_size,
+            self.use_eagle,
+        )
         # The last block-aligned position whose state can be cached. With
         # Eagle, FullAttn prunes the last matching block, so back off one
         # block to avoid a Mamba cache miss.

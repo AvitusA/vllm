@@ -265,6 +265,12 @@ class KVCacheManager:
                 request.block_hashes, max_cache_hit_length
             )
         )
+        logger.info(
+            "HITDBG req tokens=%d hit_tokens=%d per_group_blocks=%s",
+            request.num_tokens,
+            num_new_computed_tokens,
+            [len(g) for g in computed_blocks],
+        )
 
         # When kv_cache_report_mode is "full", emit BlockStored events
         # for the reused prefix cache blocks so that external consumers
