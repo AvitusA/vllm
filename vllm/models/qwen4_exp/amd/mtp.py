@@ -226,6 +226,7 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             hc_config,
             use_combine=False,
             prefix=maybe_prefix(prefix, "hyper_connection_mixer"),
+            quant_config=draft_vllm_config.quant_config,
         )
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states"], self.hidden_size * self.hc_count
