@@ -129,11 +129,12 @@ def _make_draft_vllm_config(
             speculative_config.draft_model_config.model
         )
         mibq = getattr(draft_quant_config, "modules_in_block_to_quantize", None)
-        logger.info(
-            "draft quant modules_in_block: n=%s sample=%s",
-            len(mibq) if mibq else 0,
-            sorted(m for m in (mibq or []) if m.startswith("mtp."))[:3],
-        )
+        if mibq:
+            # Metadata names carry checkpoint layer numbering (mtp.layers.0);
+            # the draft's modules live at mtp.layers.<num_hidden_layers>.
+            draft_quant_config.modules_in_block_to_quantize = _remap_ignored_layers(
+                mibq, mtp_start_layer_idx
+            )
         configure_quant_config(draft_quant_config, Qwen4ExpMTP)
         # The draft config re-derivation drops GPTQ `dynamic` rules; without
         # them the draft ignores both per-layer overrides and exclusions
