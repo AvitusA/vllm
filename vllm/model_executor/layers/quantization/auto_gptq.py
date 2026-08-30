@@ -484,6 +484,8 @@ class AutoGPTQLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if hessian_capture.enabled():
+            hessian_capture.maybe_capture(layer, x)
         return self.kernel.apply_weights(layer, x, bias)
 
 
@@ -887,6 +889,7 @@ class AutoGPTQMoEMethod(FusedMoEMethodBase):
 
 
 # Opt-in hybrid GPTQ+blockwise-fp8 dispatch (VLLM_FP8_HYBRID=1); see module.
+from vllm.model_executor.layers.quantization import hessian_capture
 from vllm.model_executor.layers.quantization.fp8_hybrid_patch import (  # noqa: E402
     apply as _apply_fp8_hybrid,
 )
