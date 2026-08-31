@@ -718,6 +718,10 @@ class TritonWNA16Experts(TritonExperts):
             topk_ids, config["BLOCK_SIZE_M"], num_align_experts, expert_map
         )
 
+        # w13 and w2 may carry different group sizes (per-projection
+        # divisibility in MoeWNA16Method.create_weights); derive each gemm's
+        # group from its own scale shape instead of the shared block_shape.
+        w1_block_shape = [0, K // self.w1_scale.size(-1)]
         invoke_fused_moe_wna16_triton_kernel(
             hidden_states,
             w1,
@@ -734,7 +738,7 @@ class TritonWNA16Experts(TritonExperts):
             compute_type=compute_type,
             use_int8_w8a16=self.quant_config.use_int8_w8a16,
             use_int4_w4a16=self.quant_config.use_int4_w4a16,
-            block_shape=self.block_shape,
+            block_shape=w1_block_shape,
         )
 
         self.activation(
@@ -751,6 +755,7 @@ class TritonWNA16Experts(TritonExperts):
             self.block_shape,
         )
 
+        w2_block_shape = [0, activation_out_dim // self.w2_scale.size(-1)]
         invoke_fused_moe_wna16_triton_kernel(
             qintermediate_cache2,
             w2,
@@ -767,7 +772,7 @@ class TritonWNA16Experts(TritonExperts):
             compute_type=compute_type,
             use_int8_w8a16=self.quant_config.use_int8_w8a16,
             use_int4_w4a16=self.quant_config.use_int4_w4a16,
-            block_shape=self.block_shape,
+            block_shape=w2_block_shape,
         )
 
         # separate function is required for MoE + LoRA
