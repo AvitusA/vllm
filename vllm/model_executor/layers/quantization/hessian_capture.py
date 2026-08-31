@@ -95,21 +95,27 @@ def maybe_capture(layer, x: torch.Tensor) -> None:
     prefix = getattr(layer, "prefix", None)
     if not prefix or not _PAT.search(prefix):
         return
-    torch.ops.vllm.hessian_capture(x, prefix)
+    out = torch.empty(1, dtype=torch.float32, device=x.device)
+    torch.ops.vllm.hessian_capture(x, out, prefix)
 
 
-def _hessian_capture_op(x: torch.Tensor, prefix: str) -> None:
-    """Opaque-to-dynamo capture body (see maybe_capture)."""
+def _hessian_capture_op(x: torch.Tensor, out: torch.Tensor, prefix: str) -> None:
+    """Opaque-to-dynamo capture body (see maybe_capture). Mutating a real
+    output arg (PLE-op pattern) keeps functionalization clean so the
+    piecewise splitter can lift the op out of captured graph pieces —
+    mutates_args on an INPUT breaks that and the CPU copy lands inside
+    cudagraph capture."""
+    out.zero_()
     _accumulate(prefix, x)
 
 
-def _hessian_capture_op_fake(x: torch.Tensor, prefix: str) -> None:
+def _hessian_capture_op_fake(x: torch.Tensor, out: torch.Tensor, prefix: str) -> None:
     return
 
 
 direct_register_custom_op(
     op_name="hessian_capture",
     op_func=_hessian_capture_op,
-    mutates_args=["x"],  # white lie: prevents DCE and pins ordering
+    mutates_args=["out"],
     fake_impl=_hessian_capture_op_fake,
 )
