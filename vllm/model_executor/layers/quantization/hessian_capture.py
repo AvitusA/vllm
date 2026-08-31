@@ -58,7 +58,7 @@ def _dump(prefix: str) -> None:
     safe = prefix.replace("/", "_")
     path = os.path.join(_ensure_rank_dir(), f"{safe}.pt")
     tmp = path + ".tmp"
-    torch.save({"h": h.cpu(), "n": n}, tmp)
+    torch.save({"h": h, "n": n}, tmp)
     os.replace(tmp, path)
 
 
@@ -77,12 +77,11 @@ def maybe_capture(layer, x: torch.Tensor) -> None:
     prefix = getattr(layer, "prefix", None)
     if not prefix or not _PAT.search(prefix):
         return
-    x2 = x.reshape(-1, x.shape[-1]).float()
+    # accumulate on CPU: ~90 targets x in^2 fp32 on GPU would cost ~2.3G/rank
+    x2 = x.reshape(-1, x.shape[-1]).float().cpu()
     st = _state.get(prefix)
     if st is None:
-        h = torch.zeros(
-            x2.shape[-1], x2.shape[-1], dtype=torch.float32, device=x2.device
-        )
+        h = torch.zeros(x2.shape[-1], x2.shape[-1], dtype=torch.float32)
         st = _state[prefix] = [h, 0, 0]
     st[0] += x2.T @ x2
     st[1] += x2.shape[0]
