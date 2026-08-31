@@ -251,17 +251,30 @@ class MoeWNA16Method(FusedMoEMethodBase):
         layer.quant_config = self.quant_config
         bit8_pack_factor = self.quant_config.bit8_pack_factor
         group_size = self.quant_config.group_size
-        group_size_div_factor = 1
 
-        # make intermediate_size and hidden_size divisible by group_size
-        # we reduce the group size to ensure that
-        # and we would repeat the loaded_weight later
-        while intermediate_size_per_partition % group_size or hidden_size % group_size:
-            group_size = group_size // 2
-            group_size_div_factor *= 2
-            assert group_size >= 32
-        layer.group_size = group_size
-        layer.group_size_div_factor = group_size_div_factor
+        # w13 groups along hidden_size, w2 along intermediate_size_per_partition.
+        # A single shared loop degraded BOTH group sizes to satisfy the other
+        # gemm's divisibility (e.g. TP4 with intermediate 640 -> inter_pp 160
+        # forces g32, and w13 scales get repeat_interleave'd 4x = ~1G/rank of
+        # redundant GPU memory for a 2560-hidden MoE). Split per projection;
+        # each repeats only what its own dimension requires.
+        w13_group_size, w13_div = group_size, 1
+        while hidden_size % w13_group_size:
+            w13_group_size = w13_group_size // 2
+            w13_div *= 2
+            assert w13_group_size >= 32
+        w2_group_size, w2_div = group_size, 1
+        while intermediate_size_per_partition % w2_group_size:
+            w2_group_size = w2_group_size // 2
+            w2_div *= 2
+            assert w2_group_size >= 32
+        layer.w13_group_size = w13_group_size
+        layer.w13_group_size_div_factor = w13_div
+        layer.w2_group_size = w2_group_size
+        layer.w2_group_size_div_factor = w2_div
+        # legacy aliases (worst-case) for any external readers
+        layer.group_size = min(w13_group_size, w2_group_size)
+        layer.group_size_div_factor = max(w13_div, w2_div)
 
         strategy = FusedMoeWeightScaleSupported.GROUP.value
         extra_weight_attrs.update({"quant_method": strategy, "is_transposed": False})
@@ -301,7 +314,7 @@ class MoeWNA16Method(FusedMoEMethodBase):
             torch.zeros(
                 num_experts,
                 self.moe.w13_num_shards * intermediate_size_per_partition,
-                hidden_size // group_size,
+                hidden_size // w13_group_size,
                 dtype=params_dtype,
             ),
             requires_grad=False,
@@ -313,7 +326,7 @@ class MoeWNA16Method(FusedMoEMethodBase):
             torch.zeros(
                 num_experts,
                 hidden_size,
-                intermediate_size_per_partition // group_size,
+                intermediate_size_per_partition // w2_group_size,
                 dtype=params_dtype,
             ),
             requires_grad=False,
@@ -328,7 +341,7 @@ class MoeWNA16Method(FusedMoEMethodBase):
                     self.moe.w13_num_shards
                     * intermediate_size_per_partition
                     // bit8_pack_factor,
-                    hidden_size // group_size,
+                    hidden_size // w13_group_size,
                     dtype=torch.uint8,
                 ),
                 requires_grad=False,
@@ -340,7 +353,7 @@ class MoeWNA16Method(FusedMoEMethodBase):
                 torch.zeros(
                     num_experts,
                     hidden_size // bit8_pack_factor,
-                    intermediate_size_per_partition // group_size,
+                    intermediate_size_per_partition // w2_group_size,
                     dtype=torch.uint8,
                 ),
                 requires_grad=False,
@@ -382,7 +395,9 @@ class MoeWNA16Method(FusedMoEMethodBase):
             w2_scale=layer.w2_scales,
             w1_zp=layer.w13_qzeros if has_zp else None,
             w2_zp=layer.w2_qzeros if has_zp else None,
-            group_size=layer.group_size,
+            # w13/w2 may carry different group sizes now; TritonWNA16Experts
+            # derives each gemm's group from its scale shapes at apply time.
+            group_size=layer.w2_group_size,
             num_bits=self.quant_config.weight_bits,
         )
 
@@ -605,15 +620,15 @@ class MoeWNA16Method(FusedMoEMethodBase):
                 else:
                     loaded_weight = loaded_weight.T
 
-            # repeat the qzeros/scales to fit new group size
-            if (
-                layer.group_size_div_factor > 1
-                and "qzeros" in weight_name
-                or "scales" in weight_name
-            ):
-                loaded_weight = loaded_weight.repeat_interleave(
-                    layer.group_size_div_factor, 1
+            # repeat the qzeros/scales to fit each projection's own group size
+            if "qzeros" in weight_name or "scales" in weight_name:
+                div = (
+                    layer.w13_group_size_div_factor
+                    if "w13" in weight_name
+                    else layer.w2_group_size_div_factor
                 )
+                if div > 1:
+                    loaded_weight = loaded_weight.repeat_interleave(div, 1)
 
             if "w13_qzeros" in weight_name:
                 tensor = loaded_weight.view(
