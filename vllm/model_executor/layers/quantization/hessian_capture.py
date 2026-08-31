@@ -74,6 +74,11 @@ def _dump_all() -> None:
 
 @torch.no_grad()
 def _accumulate(prefix: str, x: torch.Tensor) -> None:
+    # During piecewise-cudagraph CAPTURE the surrounding pieces are recorded,
+    # not executed — x holds garbage (often inf) and would poison H. Also
+    # guards genuine runaway activations. GPU-side check, cheap.
+    if not torch.isfinite(x).all():
+        return
     # accumulate on CPU: ~90 targets x in^2 fp32 on GPU would cost ~2.3G/rank
     x2 = x.reshape(-1, x.shape[-1]).float().cpu()
     st = _state.get(prefix)
