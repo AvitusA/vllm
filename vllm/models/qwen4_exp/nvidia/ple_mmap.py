@@ -886,6 +886,11 @@ def check_cudagraph_safety(
             f"{compilation_config.cudagraph_mode}. Pass "
             "-cc.cudagraph_mode=PIECEWISE."
         )
+    if os.environ.get("VLLM_PLE_MMAP_UNSAFE_EAGER") == "1":
+        # Calibration escape: with enforce-eager AND cudagraph_mode NONE there
+        # is no capture at all, so the eager mmap gather is safe. The caller
+        # asserts full-cudagraphs above regardless.
+        return
     if compilation_config.mode != CompilationMode.VLLM_COMPILE:
         raise RuntimeError(
             "VLLM_PLE_MMAP=1 requires compilation_config.mode="
