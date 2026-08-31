@@ -17,6 +17,8 @@ import re
 
 import torch
 
+from vllm.utils.torch_utils import direct_register_custom_op
+
 _DIR = os.environ.get("VLLM_HESSIAN_DIR", "")
 _PAT = re.compile(
     os.environ.get(
@@ -71,12 +73,7 @@ def _dump_all() -> None:
 
 
 @torch.no_grad()
-def maybe_capture(layer, x: torch.Tensor) -> None:
-    if not _DIR:
-        return
-    prefix = getattr(layer, "prefix", None)
-    if not prefix or not _PAT.search(prefix):
-        return
+def _accumulate(prefix: str, x: torch.Tensor) -> None:
     # accumulate on CPU: ~90 targets x in^2 fp32 on GPU would cost ~2.3G/rank
     x2 = x.reshape(-1, x.shape[-1]).float().cpu()
     st = _state.get(prefix)
@@ -88,3 +85,31 @@ def maybe_capture(layer, x: torch.Tensor) -> None:
     st[2] += 1
     if st[2] % _SNAP == 0:
         _dump(prefix)
+
+
+def maybe_capture(layer, x: torch.Tensor) -> None:
+    """Call from quant-method apply. Dispatches through an opaque custom op
+    so dynamo neither traces the stateful body nor graph-breaks on it."""
+    if not _DIR:
+        return
+    prefix = getattr(layer, "prefix", None)
+    if not prefix or not _PAT.search(prefix):
+        return
+    torch.ops.vllm.hessian_capture(x, prefix)
+
+
+def _hessian_capture_op(x: torch.Tensor, prefix: str) -> None:
+    """Opaque-to-dynamo capture body (see maybe_capture)."""
+    _accumulate(prefix, x)
+
+
+def _hessian_capture_op_fake(x: torch.Tensor, prefix: str) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="hessian_capture",
+    op_func=_hessian_capture_op,
+    mutates_args=["x"],  # white lie: prevents DCE and pins ordering
+    fake_impl=_hessian_capture_op_fake,
+)
