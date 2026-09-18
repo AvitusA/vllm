@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import math
 
+import os
+
 import torch
 
 from vllm import _custom_ops as ops
@@ -13,6 +15,56 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
 _LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
+
+
+def _env_int(name: str, default: int) -> int:
+    return int(os.getenv(name, str(default)))
+
+
+def _env_cfg(name: str) -> tuple[int, int, int] | None:
+    raw = os.getenv(name)
+    if not raw:
+        return None
+    parts = [int(x) for x in raw.split(",")]
+    assert len(parts) == 3, f"{name} wants block_n,target_splits,num_warps"
+    return parts[0], parts[1], parts[2]
+
+
+def _on_gfx1100() -> bool:
+    try:
+        from vllm.platforms.rocm import on_gfx1100
+
+        return bool(current_platform.is_rocm() and on_gfx1100())
+    except Exception:
+        return False
+
+
+_ON_GFX1100 = _on_gfx1100()
+# Sweep knobs (read once at import): VLLM_QSA_CFG="block_n,splits,warps"
+# overrides the whole ladder, VLLM_QSA_STAGES the pipelining depth,
+# VLLM_QSA_BLOCK_M_MIN the head-tile floor (16 = WMMA-eligible on RDNA3).
+_QSA_CFG_OVERRIDE = _env_cfg("VLLM_QSA_CFG")
+_QSA_STAGES_OVERRIDE = (
+    int(os.environ["VLLM_QSA_STAGES"]) if os.getenv("VLLM_QSA_STAGES") else None
+)
+_QSA_BLOCK_M_MIN = _env_int("VLLM_QSA_BLOCK_M_MIN", 16 if _ON_GFX1100 else 0)
+
+
+def _select_gfx1100_config(base_programs: int) -> tuple[int, int, int]:
+    """(block_n, target_splits, num_warps) for gfx1100 (RX 7900 XTX, wave32).
+
+    Starting point = the GB300 ladder with wave32-appropriate warp counts;
+    retuned by sweep (VLLM_QSA_CFG) on the TP4 Flash-Next shapes.
+    """
+    if base_programs <= 8:
+        return 16, 64, 4
+    if base_programs < 32:
+        return 16, 32, 4
+    if base_programs <= 256:
+        return 64, 8, 2
+    if base_programs <= 512:
+        return 64, 4, 2
+    return 64, 1, 2
 _TOPK_WORKSPACE_BYTES = 1024 * 1024
 
 
@@ -862,12 +914,21 @@ def qsa_sparse_paged_attention(
 
     group_size = q.shape[1] // k_cache.shape[2]
     block_m = triton.next_power_of_2(group_size)
+    # RDNA3 WMMA is 16x16x16: a tl.dot with M < 16 lowers to scalar FMA. With
+    # 6 query heads per KV head at TP4, block_m would be 8. Padding the head
+    # tile to 16 (masked rows are zero and never stored) keeps QK/PV on the
+    # matrix cores. VLLM_QSA_BLOCK_M_MIN=0 restores the upstream tile.
+    block_m = max(block_m, _QSA_BLOCK_M_MIN)
     base_programs = q.shape[0] * k_cache.shape[2]
     small_profile_limit = 8 if block_m <= 8 else 4
 
+    if _QSA_CFG_OVERRIDE is not None:
+        block_n, target_splits, partial_warps = _QSA_CFG_OVERRIDE
+    elif _ON_GFX1100:
+        block_n, target_splits, partial_warps = _select_gfx1100_config(base_programs)
     # Tuned on GB300 for the Qwen-Air TP1, TP2, and TP4 attention shapes.
     # Narrow tiles favor decode; wide tiles improve throughput for prefill.
-    if base_programs <= small_profile_limit:
+    elif base_programs <= small_profile_limit:
         block_n, target_splits, partial_warps = 16, 64, 4
     elif base_programs < 32:
         block_n, target_splits, partial_warps = 16, 32, 4
@@ -880,6 +941,8 @@ def qsa_sparse_paged_attention(
     # gfx942 and gfx950 have a 64 KiB LDS limit. One software-pipelining
     # stage keeps the wide TP4 tile within that shared-memory budget.
     partial_stages = 1 if current_platform.is_rocm() else 2
+    if _QSA_STAGES_OVERRIDE is not None:
+        partial_stages = _QSA_STAGES_OVERRIDE
 
     num_tiles = triton.cdiv(logical_indices.shape[1], block_n)
     # Avoid empty splits when the selection width is smaller than the profile.
