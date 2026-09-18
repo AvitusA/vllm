@@ -60,9 +60,17 @@ def _select_gfx1100_config(base_programs: int) -> tuple[int, int, int]:
     3.38 ms with the GB300 default (64, 4, 2). Narrow tiles + 4 wave32 warps
     win everywhere measured; wide 64-column tiles lose on RDNA3.
     """
+    # Sweep2/3: split-K count should fall as rows grow (merge cost):
+    # 128 rows (16,16,4) 0.53 ms; 512 rows (16,8,4) 1.64 vs (16,32,4) 1.94;
+    # 2048 rows (16,8,4) 6.27 vs (16,32,4) 7.8-8.0. block_m floor 16 vs 8: no
+    # measurable difference (kept at 16, harmless).
     if base_programs <= 8:
         return 16, 64, 4
-    return 16, 32, 4
+    if base_programs <= 32:
+        return 16, 32, 4
+    if base_programs <= 128:
+        return 16, 16, 4
+    return 16, 8, 4
 _TOPK_WORKSPACE_BYTES = 1024 * 1024
 
 
