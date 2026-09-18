@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from typing import Any
 
 import torch
 
 from vllm.distributed import get_tensor_model_parallel_rank, get_tp_group
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEConfig,
     FusedMoEMethodBase,
@@ -45,6 +47,21 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 from vllm.platforms import current_platform
+
+
+logger = init_logger(__name__)
+
+
+def mk_activation_format_standard():
+    import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+
+    return mk.FusedMoEActivationFormat.Standard
+
+
+def mk_activation_format_batched():
+    import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+
+    return mk.FusedMoEActivationFormat.BatchedExperts
 
 
 class MoeWNA16Config(QuantizationConfig):
@@ -262,6 +279,49 @@ class MoeWNA16Method(FusedMoEMethodBase):
             may_have_zp=self.quant_config.has_zp,
             may_have_bias=False,
         )
+        self._maybe_select_rdna3_backend(weight_key)
+
+    def _maybe_select_rdna3_backend(self, weight_key: QuantKey) -> None:
+        """Route symmetric int4 GPTQ/auto_round MoE experts to the native
+        gfx1100 HIP kernel (``moe_gptq_gemm_rdna3``).
+
+        The oracle only admits compressed-tensors checkpoints to the RDNA3
+        backend because that method allocates the kernel's ``[E, K/8, N]``
+        layout directly; this method loads the triton ``[E, N, K/2]`` uint8
+        layout instead and repacks after loading (see
+        ``_repack_for_rdna3``). VLLM_MOE_WNA16_RDNA3=0 keeps the triton path.
+        """
+        if os.getenv("VLLM_MOE_WNA16_RDNA3", "1") != "1":
+            return
+        if self.quant_config.weight_bits != 4 or self.quant_config.has_zp:
+            return
+        if self.quant_config.linear_quant_method != "gptq":
+            return
+        from vllm.model_executor.layers.fused_moe.experts.rdna3_moe import (
+            Rdna3WNA16Experts,
+            rdna3_moe_kernel_available,
+        )
+
+        if not rdna3_moe_kernel_available():
+            return
+        activation_format = (
+            mk_activation_format_batched()
+            if self.moe.moe_parallel_config.use_batched_activation_format
+            else mk_activation_format_standard()
+        )
+        supported, reason = Rdna3WNA16Experts.is_supported_config(
+            Rdna3WNA16Experts, self.moe, weight_key, None, activation_format
+        )
+        if not supported:
+            logger.info_once(
+                "RDNA3 WNA16 MoE kernel not used: %s", reason, scope="local"
+            )
+            return
+        self.wna16_backend = WNA16MoEBackend.RDNA3
+        self.experts_cls = Rdna3WNA16Experts
+        logger.info_once(
+            "Using native RDNA3 HIP WNA16 MoE kernel for GPTQ experts", scope="local"
+        )
 
     def create_weights(
         self,
@@ -414,6 +474,9 @@ class MoeWNA16Method(FusedMoEMethodBase):
             )
 
         has_zp = self.quant_config.has_zp
+        # The RDNA3 kernel always consumes (synthesized) zero points.
+        if self.wna16_backend == WNA16MoEBackend.RDNA3:
+            has_zp = True
         return make_wna16_moe_quant_config(
             w1_scale=layer.w13_scales,
             w2_scale=layer.w2_scales,
@@ -437,8 +500,61 @@ class MoeWNA16Method(FusedMoEMethodBase):
             routing_tables=layer._expert_routing_tables(),
         )
 
+    @staticmethod
+    def _uint8_nk_to_gptq(w: torch.Tensor, chunk: int = 32) -> torch.Tensor:
+        """[E, N, K/2] uint8 (nibble k even = low) -> GPTQ int32 [E, K/8, N]."""
+        E, N, K2 = w.shape
+        K = K2 * 2
+        out = torch.empty((E, K // 8, N), dtype=torch.int32, device=w.device)
+        for e0 in range(0, E, chunk):
+            we = w[e0 : e0 + chunk]
+            nib = torch.stack((we & 0xF, we >> 4), dim=-1).reshape(we.shape[0], N, K)
+            q = nib.permute(0, 2, 1).reshape(we.shape[0], K // 8, 8, N).to(torch.int32)
+            packed = torch.zeros((we.shape[0], K // 8, N), dtype=torch.int32, device=w.device)
+            for j in range(8):
+                packed |= q[:, :, j, :] << (4 * j)
+            out[e0 : e0 + chunk] = packed
+        return out
+
+    def _repack_for_rdna3(self, layer: RoutedExperts) -> None:
+        """Triton layout -> kernel layout: GPTQ int32 [E, K/8, N] + exllama shuffle,
+        scales [E, groups, N], synthesized symmetric zeros [E, groups, N/8].
+        w13 keeps its own group size and w2 its (possibly halved, scale-repeated)
+        one; the kernel derives groupsize = K / groups per GEMM call."""
+        import vllm._custom_ops as ops
+        from vllm.model_executor.layers.fused_moe.oracle.int_wna16 import (
+            _synthesize_rdna3_qzeros,
+        )
+
+        def _one(qweight: torch.Tensor, scales: torch.Tensor):
+            w = self._uint8_nk_to_gptq(qweight.data)
+            for e in range(w.shape[0]):
+                we = w[e].contiguous()
+                ops.gptq_shuffle(we, 4)
+                w[e] = we
+            s = scales.data.permute(0, 2, 1).contiguous()  # [E, G, N]
+            groups, n = s.shape[1], s.shape[2]
+            zp = _synthesize_rdna3_qzeros(groups, n, w.device)
+            zp = zp.unsqueeze(0).expand(w.shape[0], -1, -1).contiguous()
+            return w, s, zp
+
+        w13, s13, z13 = _one(layer.w13_qweight, layer.w13_scales)
+        w2, s2, z2 = _one(layer.w2_qweight, layer.w2_scales)
+        replace_parameter(layer, "w13_qweight", w13)
+        replace_parameter(layer, "w2_qweight", w2)
+        replace_parameter(layer, "w13_scales", s13)
+        replace_parameter(layer, "w2_scales", s2)
+        replace_parameter(layer, "w13_qzeros", z13)
+        replace_parameter(layer, "w2_qzeros", z2)
+        layer.w13_weight = layer.w13_qweight
+        layer.w2_weight = layer.w2_qweight
+        self._setup_kernel(layer)
+
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
         has_zp = self.quant_config.has_zp
+        if self.wna16_backend == WNA16MoEBackend.RDNA3:
+            self._repack_for_rdna3(layer)
+            return
         converted = convert_to_wna16_moe_kernel_format(
             backend=self.wna16_backend,
             layer=layer,
