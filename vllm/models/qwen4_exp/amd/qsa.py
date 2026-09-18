@@ -6,6 +6,8 @@ from __future__ import annotations
 
 from typing import ClassVar, cast
 
+import os
+
 import torch
 from torch import nn
 
@@ -56,6 +58,9 @@ from vllm.v1.kv_cache_interface import (
 from ..common.qsa_cache import QSAForwardMetadata
 from . import model
 from .indexer_qsa import QSAIndexer
+
+
+_QSA_FUSED_GATE = os.getenv("VLLM_QSA_FUSED_GATE", "1") == "1"
 
 
 class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
@@ -126,6 +131,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         token_to_req: torch.Tensor,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
+        output_gate: torch.Tensor | None = None,
     ) -> torch.Tensor:
         del key, value
         if output_scale is not None or output_block_scale is not None:
@@ -161,6 +167,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             attn_metadata.block_table,
             token_to_req,
             output[:num_tokens],
+            output_gate=None if output_gate is None else output_gate[:num_tokens],
         )
         return output
 
@@ -333,6 +340,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         key: torch.Tensor,
         value: torch.Tensor,
         output: torch.Tensor,
+        output_gate: torch.Tensor | None = None,
     ) -> None:
         metadata = get_forward_context().attn_metadata
         if isinstance(metadata, list):
@@ -378,6 +386,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             main_metadata,
             output,
             token_to_req=side_metadata.token_to_req,
+            output_gate=output_gate,
         )
 
     def forward(
@@ -393,6 +402,11 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         value = v.view(num_tokens, self.num_kv_heads, self.head_dim)
         attn_output = torch.empty_like(query)
         encoded_layer_name = _encode_layer_name(self.layer_name)
+        # Fused gate: sigmoid(gate) applied in the attention epilogue
+        # (upstream #55309 on the nvidia tree); VLLM_QSA_FUSED_GATE=0 -> eager.
+        fused_gate = (
+            gate.contiguous() if (gate is not None and _QSA_FUSED_GATE) else None
+        )
         if current_platform.opaque_attention_op():
             torch.ops.vllm.qwen4_exp_qsa_with_output(
                 hidden_states,
@@ -401,6 +415,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 key,
                 value,
                 attn_output,
+                fused_gate,
                 encoded_layer_name,
             )
         else:
@@ -411,10 +426,11 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 key,
                 value,
                 attn_output,
+                fused_gate,
                 encoded_layer_name,
             )
         flat_output = attn_output.view(num_tokens, -1)
-        if gate is not None:
+        if gate is not None and fused_gate is None:
             flat_output = flat_output * torch.sigmoid(gate)
         output, _ = self.o_proj(flat_output)
         return output
@@ -427,6 +443,7 @@ def qwen4_exp_qsa_with_output(
     key: torch.Tensor,
     value: torch.Tensor,
     output: torch.Tensor,
+    output_gate: torch.Tensor | None,
     layer_name: LayerNameType,
 ) -> None:
     """Run the complete QSA state/update/attend transaction."""
@@ -441,6 +458,7 @@ def qwen4_exp_qsa_with_output(
         key,
         value,
         output,
+        output_gate,
     )
 
 
