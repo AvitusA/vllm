@@ -5,11 +5,14 @@
 from collections.abc import Iterable
 from itertools import islice
 
+import os
+
 import torch
 from torch import nn
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.logger import init_logger
 from vllm.distributed import get_pp_group
 from vllm.model_executor.layers.fused_moe.utils import (
     is_model_fused_shared_expert_compatible,
@@ -154,6 +157,44 @@ _HC_WEIGHTS_MAPPER = WeightsMapper(
         ),
     }
 )
+
+
+
+logger = init_logger(__name__)
+
+
+def _maybe_host_resident_embedding(module, name: str) -> None:
+    """Move a vocab embedding's weight into pinned host RAM behind a UVA view.
+
+    A token embedding is read as a handful of row gathers per token - the same
+    access pattern that makes the 95 GiB n-gram table affordable from host
+    memory - so keeping it off the GPU is lossless and costs a few KiB of PCIe
+    traffic per token. The view is an ordinary device-addressable tensor, so
+    the lookup still runs inside a captured graph. Frees ~0.30 GiB/rank at TP4.
+    VLLM_HOST_EMBED=1 enables it (default off).
+    """
+    if os.environ.get("VLLM_HOST_EMBED", "0").strip() != "1":
+        return
+    weight = getattr(module, "weight", None)
+    if not isinstance(weight, torch.Tensor) or weight.device.type == "cpu":
+        return
+    from vllm.utils.platform_utils import is_uva_available
+    from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+
+    if not is_uva_available():
+        logger.warning("VLLM_HOST_EMBED=1 but UVA is unavailable; keeping %s on GPU", name)
+        return
+    host = torch.empty(weight.shape, dtype=weight.dtype, device="cpu", pin_memory=True)
+    host.copy_(weight.data)
+    view = get_accelerator_view_from_cpu_tensor(host)
+    module.weight = torch.nn.Parameter(view, requires_grad=False)
+    # keep the pinned allocation alive for the module's lifetime
+    module._host_embed_backing = host
+    torch.cuda.empty_cache()
+    logger.info(
+        "%s: %.3f GiB embedding moved to pinned host memory (UVA)",
+        name, host.numel() * host.element_size() / 2**30,
+    )
 
 
 class Qwen4ExpSparseMoeBlock(Qwen3NextSparseMoeBlock):
@@ -835,6 +876,9 @@ class Qwen4ExpForCausalLM(
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
         loaded = loader.load_weights(weights, mapper=mapper)
+        _maybe_host_resident_embedding(
+            self.model.embed_tokens, "language_model.embed_tokens"
+        )
         if ple_mmap.enabled():
             ple_mmap.build_tables(
                 self.model_config, get_current_vllm_config().compilation_config
@@ -1034,6 +1078,9 @@ class Qwen4ExpForConditionalGeneration(
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
         loaded = loader.load_weights(weights, mapper=mapper)
+        _maybe_host_resident_embedding(
+            self.model.embed_tokens, "language_model.embed_tokens"
+        )
         if ple_mmap.enabled():
             ple_mmap.build_tables(
                 self.model_config, get_current_vllm_config().compilation_config
