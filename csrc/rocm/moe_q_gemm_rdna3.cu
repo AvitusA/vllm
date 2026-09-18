@@ -588,7 +588,9 @@ void moe_gptq_gemm_rdna3(torch::Tensor a, torch::Tensor c,
   TORCH_CHECK(c.dim() == 2, "c must be 2D");
   TORCH_CHECK(b_q_weight.dim() == 3, "b_q_weight must be 3D [E, K/8, N]");
   TORCH_CHECK(b_scales.dim() == 3, "b_scales must be 3D [E, groups, N]");
-  TORCH_CHECK(b_qzeros.dim() == 3, "b_qzeros must be 3D [E, groups, N/8]");
+  TORCH_CHECK(b_qzeros.dim() == 3,
+              "b_qzeros must be 3D [E, groups, N/8] (E may be 1 to broadcast "
+              "one shared block to every expert)");
   TORCH_CHECK(
       a.scalar_type() == torch::kHalf || a.scalar_type() == torch::kBFloat16,
       "a must be half or bfloat16");
@@ -606,7 +608,12 @@ void moe_gptq_gemm_rdna3(torch::Tensor a, torch::Tensor c,
   // Per-expert strides
   int expert_weight_stride = (int)(b_q_weight.size(1) * b_q_weight.size(2));
   int expert_scales_stride = (int)(b_scales.size(1) * b_scales.size(2));
-  int expert_zeros_stride = (int)(b_qzeros.size(1) * b_qzeros.size(2));
+  // A symmetric checkpoint has the SAME synthesized zero-point block for every
+  // expert, so callers may pass a single [1, groups, N/8] block instead of E
+  // identical copies (512 copies cost ~236 MiB/rank on Qwen4Exp at TP4).
+  // Stride 0 then makes every expert read that one block.
+  int expert_zeros_stride =
+      (b_qzeros.size(0) == 1) ? 0 : (int)(b_qzeros.size(1) * b_qzeros.size(2));
 
   int num_token_blocks = (int)(sorted_token_ids.size(0) / block_size_m);
 

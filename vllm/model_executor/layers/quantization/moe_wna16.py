@@ -535,7 +535,15 @@ class MoeWNA16Method(FusedMoEMethodBase):
             s = scales.data.permute(0, 2, 1).contiguous()  # [E, G, N]
             groups, n = s.shape[1], s.shape[2]
             zp = _synthesize_rdna3_qzeros(groups, n, w.device)
-            zp = zp.unsqueeze(0).expand(w.shape[0], -1, -1).contiguous()
+            # Symmetric GPTQ: the synthesized zero block is identical for every
+            # expert. The RDNA3 entry point takes stride 0 when the leading dim
+            # is 1, so ship ONE block instead of num_experts copies (~236
+            # MiB/rank on Qwen4Exp at TP4). VLLM_MOE_RDNA3_BCAST_ZP=0 restores
+            # the materialized form for A/B.
+            if os.getenv("VLLM_MOE_RDNA3_BCAST_ZP", "1") == "1":
+                zp = zp.unsqueeze(0).contiguous()
+            else:
+                zp = zp.unsqueeze(0).expand(w.shape[0], -1, -1).contiguous()
             return w, s, zp
 
         w13, s13, z13 = _one(layer.w13_qweight, layer.w13_scales)
