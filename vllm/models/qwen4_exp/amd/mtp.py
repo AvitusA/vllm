@@ -132,6 +132,30 @@ def _make_draft_vllm_config(
     # inject packed and ignored modules to the quantization config of draft model
     if draft_quant_config is not None:
         configure_quant_config(draft_quant_config, Qwen4ExpMTP)
+        # The draft config re-derivation drops GPTQ `dynamic` rules; without
+        # them the draft ignores both per-layer overrides and exclusions
+        # (e.g. a bf16 MTP sidecar gets quantized-init experts). Carry the
+        # target's rules over verbatim - they match by prefix regex, so
+        # 'mtp.'-scoped exclusions apply to the draft's own module names.
+        target_dynamic = getattr(vllm_config.quant_config, "dynamic", None)
+        if target_dynamic and not getattr(draft_quant_config, "dynamic", None):
+            draft_quant_config.dynamic = target_dynamic
+        # The target's config gets modules_in_block_to_quantize populated from
+        # checkpoint metadata via maybe_update_config; the re-derived draft
+        # config never runs it, so every draft linear fails the
+        # is_layer_gptq_quantized membership check and initializes
+        # unquantized regardless of dynamic rules. Metadata names carry
+        # checkpoint layer numbering (mtp.layers.0); the draft's modules live
+        # at mtp.layers.<num_hidden_layers>.
+        if hasattr(draft_quant_config, "maybe_update_config"):
+            draft_quant_config.maybe_update_config(
+                speculative_config.draft_model_config.model
+            )
+            mibq = getattr(draft_quant_config, "modules_in_block_to_quantize", None)
+            if mibq:
+                draft_quant_config.modules_in_block_to_quantize = (
+                    _remap_ignored_layers(mibq, mtp_start_layer_idx)
+                )
         ignored_layers = getattr(draft_quant_config, "ignored_layers", None)
         if ignored_layers:
             setattr(  # noqa: B010
@@ -252,6 +276,7 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             hc_config,
             use_combine=False,
             prefix=maybe_prefix(prefix, "hyper_connection_mixer"),
+            quant_config=draft_vllm_config.quant_config,
         )
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states"], self.hidden_size * self.hc_count
@@ -418,6 +443,7 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
                 self.lm_head = ParallelLMHead(
                     config.vocab_size,
                     config.hidden_size,
+                    quant_config=self.quant_config,
                     prefix=maybe_prefix(prefix, "lm_head"),
                 )
         else:

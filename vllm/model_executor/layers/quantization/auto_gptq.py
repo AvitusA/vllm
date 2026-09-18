@@ -240,14 +240,34 @@ class AutoGPTQConfig(QuantizationConfig):
         if isinstance(layer, RoutedExperts):
             from vllm.model_executor.layers.quantization.moe_wna16 import MoeWNA16Config
 
+            # Dynamic '-' exclusions must apply before the marlin/WNA16
+            # dispatch, or excluded experts (e.g. a bf16 MTP sidecar)
+            # get quantized-init unconditionally on non-marlin platforms.
+            if get_dynamic_override(self, layer_name=prefix) == False:  # noqa: E712
+                return UnquantizedFusedMoEMethod(layer.moe_config)
+            # Resolve per-layer dynamic overrides (bits/group_size) BEFORE
+            # dispatch: the WNA16 fallback used to read the base full_config,
+            # so an override like a per-layer int8 MoE built an int4-packed
+            # kernel against int8 tensors (pack-factor shape mismatch).
+            from vllm.model_executor.layers.quantization.utils.gptq_utils import (
+                override_config,
+            )
+
+            resolved = deepcopy(self)
+            if prefix:
+                override_config(resolved, prefix=prefix)
+
             if not check_moe_marlin_supports_layer(
-                layer, self.group_size, allow_tile_padding=True
+                layer, resolved.group_size, allow_tile_padding=True
             ):
                 logger.warning_once(
                     f"Layer '{prefix}' is not supported by GPTQMoeMarlin. "
                     "Falling back to Moe WNA16 kernels."
                 )
-                return MoeWNA16Config.from_config(self.full_config).get_quant_method(
+                wna_config = dict(self.full_config)
+                wna_config["bits"] = resolved.weight_bits
+                wna_config["group_size"] = resolved.group_size
+                return MoeWNA16Config.from_config(wna_config).get_quant_method(
                     layer, prefix
                 )
             moe_quant_method = get_moe_quant_method(
