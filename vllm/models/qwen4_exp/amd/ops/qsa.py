@@ -54,18 +54,15 @@ _QSA_COMPACT_LOGITS = os.getenv("VLLM_QSA_COMPACT_LOGITS", "1") == "1"
 def _select_gfx1100_config(base_programs: int) -> tuple[int, int, int]:
     """(block_n, target_splits, num_warps) for gfx1100 (RX 7900 XTX, wave32).
 
-    Starting point = the GB300 ladder with wave32-appropriate warp counts;
-    retuned by sweep (VLLM_QSA_CFG) on the TP4 Flash-Next shapes.
+    Swept 09-18 on RX 7900 XTX (scripts/qsa-sweep.sh, topk 2048, 6 q heads /
+    1 kv head, head_dim 256, block_m 16): decode (1 row) is config-insensitive
+    (0.115 ms); a 512-row prefill chunk runs 1.94 ms with (16, 32, 4) vs
+    3.38 ms with the GB300 default (64, 4, 2). Narrow tiles + 4 wave32 warps
+    win everywhere measured; wide 64-column tiles lose on RDNA3.
     """
     if base_programs <= 8:
         return 16, 64, 4
-    if base_programs < 32:
-        return 16, 32, 4
-    if base_programs <= 256:
-        return 64, 8, 2
-    if base_programs <= 512:
-        return 64, 4, 2
-    return 64, 1, 2
+    return 16, 32, 4
 _TOPK_WORKSPACE_BYTES = 1024 * 1024
 
 
