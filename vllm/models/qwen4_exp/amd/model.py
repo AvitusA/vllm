@@ -163,7 +163,22 @@ _HC_WEIGHTS_MAPPER = WeightsMapper(
 logger = init_logger(__name__)
 
 
-def _maybe_host_resident_embedding(module, name: str) -> None:
+def _find_embed_tokens(root):
+    """embed_tokens under either the text class (self.model) or the
+    multimodal wrapper (self.language_model.model)."""
+    for path in ("model", "language_model.model"):
+        obj = root
+        for part in path.split("."):
+            obj = getattr(obj, part, None)
+            if obj is None:
+                break
+        emb = getattr(obj, "embed_tokens", None) if obj is not None else None
+        if emb is not None and isinstance(getattr(emb, "weight", None), torch.Tensor):
+            return emb, f"{path}.embed_tokens"
+    return None, ""
+
+
+def _maybe_host_resident_embedding(root, name: str) -> None:
     """Move a vocab embedding's weight into pinned host RAM behind a UVA view.
 
     A token embedding is read as a handful of row gathers per token - the same
@@ -175,8 +190,13 @@ def _maybe_host_resident_embedding(module, name: str) -> None:
     """
     if os.environ.get("VLLM_HOST_EMBED", "0").strip() != "1":
         return
-    weight = getattr(module, "weight", None)
-    if not isinstance(weight, torch.Tensor) or weight.device.type == "cpu":
+    module, found = _find_embed_tokens(root)
+    if module is None:
+        logger.warning("VLLM_HOST_EMBED=1 but no embed_tokens found under %s", type(root).__name__)
+        return
+    name = found or name
+    weight = module.weight
+    if weight.device.type == "cpu":
         return
     from vllm.utils.platform_utils import is_uva_available
     from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
@@ -876,9 +896,7 @@ class Qwen4ExpForCausalLM(
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
         loaded = loader.load_weights(weights, mapper=mapper)
-        _maybe_host_resident_embedding(
-            self.model.embed_tokens, "language_model.embed_tokens"
-        )
+        _maybe_host_resident_embedding(self, "embed_tokens")
         if ple_mmap.enabled():
             ple_mmap.build_tables(
                 self.model_config, get_current_vllm_config().compilation_config
@@ -1078,9 +1096,7 @@ class Qwen4ExpForConditionalGeneration(
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
         loaded = loader.load_weights(weights, mapper=mapper)
-        _maybe_host_resident_embedding(
-            self.model.embed_tokens, "language_model.embed_tokens"
-        )
+        _maybe_host_resident_embedding(self, "embed_tokens")
         if ple_mmap.enabled():
             ple_mmap.build_tables(
                 self.model_config, get_current_vllm_config().compilation_config
