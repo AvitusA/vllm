@@ -48,6 +48,7 @@ _QSA_STAGES_OVERRIDE = (
     int(os.environ["VLLM_QSA_STAGES"]) if os.getenv("VLLM_QSA_STAGES") else None
 )
 _QSA_BLOCK_M_MIN = _env_int("VLLM_QSA_BLOCK_M_MIN", 16 if _ON_GFX1100 else 0)
+_QSA_COMPACT_LOGITS = os.getenv("VLLM_QSA_COMPACT_LOGITS", "1") == "1"
 
 
 def _select_gfx1100_config(base_programs: int) -> tuple[int, int, int]:
@@ -818,8 +819,15 @@ def qsa_select_paged_tokens(
     token_topk: int,
     compress_ratio: int,
     out: torch.Tensor | None = None,
+    max_seq_len: int | None = None,
 ) -> torch.Tensor:
-    """Score, select, and expand QSA indices without host synchronization."""
+    """Score, select, and expand QSA indices without host synchronization.
+
+    ``max_seq_len`` (longest context in the batch) bounds the scored logits
+    row to cdiv(max_seq_len, compress_ratio) columns instead of the full
+    page-table capacity (upstream #54915): the top-k reads only the
+    ``visible_blocks`` prefix, so nothing beyond that width is ever needed.
+    """
     rows = q.shape[0]
     output_width = token_topk + compress_ratio - 1
     if out is None:
@@ -830,6 +838,9 @@ def qsa_select_paged_tokens(
         return out
 
     columns = page_table.shape[1] * k_cache.shape[1]
+    if max_seq_len is not None and _QSA_COMPACT_LOGITS:
+        logits_width = triton.cdiv(triton.cdiv(max_seq_len, compress_ratio), 64) * 64
+        columns = min(max(64, logits_width), columns)
     block_topk = token_topk // compress_ratio
     rows_per_chunk = max(1, _LOGITS_WORKSPACE_BYTES // max(columns * 4, 1))
     chunk_rows = min(rows, rows_per_chunk)
@@ -850,6 +861,7 @@ def qsa_select_paged_tokens(
             query_positions[row_slice],
             sequence_lengths,
             compress_ratio,
+            num_columns=columns,
         )
         blocks = blocks_buffer[: row_end - row_start]
         use_cooperative_topk = (
