@@ -31,6 +31,9 @@ from vllm.v1.attention.backends.short_conv_attn import (
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 from ..common.ple import PLEVocabParallelEmbedding
+from ..nvidia import ple_mmap
+
+_QUALIFIED_AMD_PLE_OP_NAME = "vllm::qwen4_exp_amd_ple_mmap_forward"
 
 
 class Qwen4ExpPLEGroupedNorm(nn.Module):
@@ -224,12 +227,28 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         )
         divisor = int(config.make_ngram_vocab_size_divisible_by)
         padded_vocab_size = ((total_vocab_size + divisor - 1) // divisor) * divisor
-        self.ngram_embedding = PLEVocabParallelEmbedding(
-            padded_vocab_size,
-            self.head_dim,
-            padding_size=divisor,
-            prefix=f"{prefix}.ngram_embedding",
-        )
+        self.ngram_embedding: PLEVocabParallelEmbedding | ple_mmap.MmapNgramEmbedding
+        if ple_mmap.enabled():
+            # Disk-backed table (np.memmap over the checkpoint shards): the
+            # 51B-row table never becomes GPU- or host-resident.
+            vllm_config = get_current_vllm_config()
+            ple_mmap.check_cudagraph_safety(
+                vllm_config.compilation_config,
+                qualified_op_name=_QUALIFIED_AMD_PLE_OP_NAME,
+            )
+            ple_mmap.validate_shards_for(
+                vllm_config.model_config, layer_name, self.head_dim
+            )
+            self.ngram_embedding = ple_mmap.MmapNgramEmbedding(
+                padded_vocab_size, self.head_dim
+            )
+        else:
+            self.ngram_embedding = PLEVocabParallelEmbedding(
+                padded_vocab_size,
+                self.head_dim,
+                padding_size=divisor,
+                prefix=f"{prefix}.ngram_embedding",
+            )
         self.register_buffer(
             "positions_buffer",
             torch.arange(max_total_tokens, dtype=torch.int64),
@@ -280,7 +299,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         valid = (source.unsqueeze(0) >= 0) & (position_in_segment >= shift)
         return torch.where(valid, shifted, tokens.new_full((), eos_token_id))
 
-    def forward(
+    def _hash_ngram_ids(
         self,
         input_ids: torch.Tensor,
         query_start_loc: torch.Tensor,
@@ -343,7 +362,30 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             offsets = self.ngram_heads_offsets[start:end]
             ids = torch.remainder(mixed.unsqueeze(-1), sizes) + offsets
             id_blocks.append(ids[request_indices, adjusted_columns])
-        ngram_ids = torch.cat(id_blocks, dim=-1)
+        return torch.cat(id_blocks, dim=-1)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        ngram_context: torch.Tensor,
+    ) -> torch.Tensor:
+        if isinstance(self.ngram_embedding, ple_mmap.MmapNgramEmbedding):
+            # Widen the eager-op boundary to the WHOLE forward, like the
+            # nvidia mmap path: under piecewise capture the preceding graph
+            # piece is recorded, not executed, so a pre-hashed ngram_ids
+            # tensor holds garbage - only the persistent input buffers are
+            # valid. Hashing must run inside the op, from input_ids.
+            num_tokens = input_ids.reshape(-1).shape[0]
+            output = input_ids.new_empty(
+                (num_tokens, self.embedding_dim),
+                dtype=self.ngram_embedding.torch_dtype,
+            )
+            torch.ops.vllm.qwen4_exp_amd_ple_mmap_forward(
+                input_ids, query_start_loc, ngram_context, output, self.layer_name
+            )
+            return output
+        ngram_ids = self._hash_ngram_ids(input_ids, query_start_loc, ngram_context)
         output = ngram_ids.new_empty(
             (ngram_ids.shape[0], self.embedding_dim),
             dtype=self.ngram_embedding.params_dtype,
@@ -380,12 +422,34 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 buffer.copy_(loaded_weight.to(device=buffer.device, dtype=buffer.dtype))
                 loaded.add(name)
                 continue
+            if (
+                isinstance(self.ngram_embedding, ple_mmap.MmapNgramEmbedding)
+                and name == "ngram_embedding.weight_scale"
+            ):
+                ple_mmap.set_weight_scale(
+                    self.ngram_embedding,
+                    loaded_weight,
+                    self.layer_multipliers.device,
+                )
+                loaded.add(name)
+                continue
             if name.startswith(shard_prefix) and name.endswith(".weight"):
                 shard_text = name[len(shard_prefix) : -len(".weight")]
                 if not shard_text.isdigit():
                     regular_weights.append((name, loaded_weight))
                     continue
                 shard_index = int(shard_text)
+                if isinstance(self.ngram_embedding, ple_mmap.MmapNgramEmbedding):
+                    # Served from disk via mmap; the loader still streams
+                    # this shard transiently, but it is never retained.
+                    if shard_index >= self.split_ngram_parts:
+                        raise ValueError(
+                            f"PLE embedding shard index {shard_index} exceeds "
+                            f"split_ngram_parts={self.split_ngram_parts}"
+                        )
+                    self.ngram_embedding.weights_streamed = True
+                    loaded.add("ngram_embedding.weight")
+                    continue
                 if shard_index >= self.split_ngram_parts:
                     raise ValueError(
                         f"PLE embedding shard index {shard_index} exceeds "
@@ -1029,6 +1093,25 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             conv_weights.to(dtype=inputs.dtype),
         )
 
+    def _get_embedding_weight_scale(self) -> torch.Tensor | None:
+        embedding = getattr(self.ple_embedding, "ngram_embedding", None)
+        return getattr(embedding, "weight_scale", None)
+
+    def _dequantize_embeddings(
+        self,
+        embeddings: torch.Tensor,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Dequantize PLE lookup output (fp8 mmap tables carry a global scale)."""
+        if embeddings.dtype != torch.float8_e4m3fn:
+            return embeddings.to(output_dtype)
+        weight_scale = self._get_embedding_weight_scale()
+        if weight_scale is None:
+            raise RuntimeError("FP8 PLE embedding is missing its global scale")
+        return embeddings.to(output_dtype) * weight_scale.to(
+            device=embeddings.device, dtype=output_dtype
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1044,6 +1127,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                 f"{hidden_states.shape[0]}"
             )
         embeddings = self.ple_embedding(input_ids, query_start_loc, ngram_context)
+        embeddings = self._dequantize_embeddings(embeddings, hidden_states.dtype)
         key, _ = self.key_proj(embeddings)
         value, _ = self.value_proj(embeddings)
         token_count = hidden_states.shape[0]
@@ -1081,6 +1165,41 @@ def qwen4_exp_amd_ple_ngram_embedding(
     output.copy_(result)
 
 
+def qwen4_exp_amd_ple_mmap_forward(
+    input_ids: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    ngram_context: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    """Whole-forward eager op for the mmap PLE path: hash + disk gather.
+
+    The hashing must run inside the op (from the persistent input buffers),
+    not in the surrounding graph piece - under piecewise capture that piece
+    is recorded without execution, so any pre-hashed ids tensor holds
+    garbage and would index the mmap table out of range.
+    """
+    layer = get_forward_context().no_compile_layers[layer_name]
+    if not isinstance(layer, Qwen4ExpPLELayer):
+        raise TypeError(f"{layer_name} is not a Qwen4Exp PLE owner")
+    ple_embedding = layer.ple_embedding
+    ngram_ids = ple_embedding._hash_ngram_ids(
+        input_ids, query_start_loc, ngram_context
+    )
+    result = ple_embedding.ngram_embedding(ngram_ids).flatten(-2)
+    output.copy_(result)
+
+
+def qwen4_exp_amd_ple_mmap_forward_fake(
+    input_ids: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    ngram_context: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    return
+
+
 def qwen4_exp_ple_short_conv(
     inputs: torch.Tensor,
     output: torch.Tensor,
@@ -1095,6 +1214,14 @@ direct_register_custom_op(
     op_name="qwen4_exp_amd_ple_ngram_embedding",
     op_func=qwen4_exp_amd_ple_ngram_embedding,
     mutates_args=["output"],
+)
+
+
+direct_register_custom_op(
+    op_name="qwen4_exp_amd_ple_mmap_forward",
+    op_func=qwen4_exp_amd_ple_mmap_forward,
+    mutates_args=["output"],
+    fake_impl=qwen4_exp_amd_ple_mmap_forward_fake,
 )
 
 

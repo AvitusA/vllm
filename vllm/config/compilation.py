@@ -769,6 +769,8 @@ class CompilationConfig:
         "vllm::short_conv",
         # Qwen4Exp's AMD backend still uses these splitting ops.
         "vllm::qwen4_exp_ple_short_conv",
+        "vllm::qwen4_exp_ple_mmap_forward",
+        "vllm::qwen4_exp_amd_ple_mmap_forward",
         "vllm::qwen4_exp_qsa_with_output",
         "vllm::linear_attention",
         "vllm::qwen_gdn_attention_core",
