@@ -3,6 +3,7 @@
 """GPU-resident Qwen4Exp position-learning enhancement layers."""
 
 import math
+import os
 from collections.abc import Iterable, Sequence
 
 import torch
@@ -236,9 +237,13 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 vllm_config.compilation_config,
                 qualified_op_name=_QUALIFIED_AMD_PLE_OP_NAME,
             )
-            ple_mmap.validate_shards_for(
-                vllm_config.model_config, layer_name, self.head_dim
-            )
+            # VLLM_PLE_MMAP_SKIP_VALIDATE=1: debug knob for --load-format dummy
+            # smoke boots on a partially downloaded checkpoint (the dummy
+            # load never attaches or reads the table).
+            if os.getenv("VLLM_PLE_MMAP_SKIP_VALIDATE", "0") != "1":
+                ple_mmap.validate_shards_for(
+                    vllm_config.model_config, layer_name, self.head_dim
+                )
             self.ngram_embedding = ple_mmap.MmapNgramEmbedding(
                 padded_vocab_size, self.head_dim
             )
