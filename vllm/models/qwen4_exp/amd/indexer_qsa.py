@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import cast
 
 import torch
@@ -25,6 +26,12 @@ from ..common.qsa_cache import (
     QSAKeyStateCache,
     canonical_qsa_rope_positions,
 )
+
+
+# VLLM_QSA_INDEXER_SPLIT=1 (default): score decode rows with the request-major
+# uniform kernel and prefill rows with the row-tiled kernel (upstream #54513 /
+# #54915 port in ops/qsa_indexer.py); 0 = legacy single qsa_select_paged_tokens.
+_QSA_INDEXER_SPLIT = os.getenv("VLLM_QSA_INDEXER_SPLIT", "1") == "1"
 
 
 def apply_qsa_rope(
@@ -253,6 +260,33 @@ class QSAIndexer(nn.Module):
                 position_rows,
             )
 
+    @staticmethod
+    def _can_split(metadata: QSAForwardMetadata, num_rows: int) -> bool:
+        """True when the metadata carries a consistent decode/prefill split."""
+        needed = (
+            "num_decodes",
+            "num_decode_tokens",
+            "num_prefill_tokens",
+            "decode_query_len",
+            "max_query_len",
+            "max_seq_len",
+            "visible_blocks",
+            "query_start_loc",
+        )
+        if any(getattr(metadata, name, None) is None for name in needed):
+            return False
+        num_decode_tokens = metadata.num_decode_tokens
+        if num_decode_tokens + metadata.num_prefill_tokens != num_rows:
+            return False
+        if num_decode_tokens and (
+            metadata.decode_query_len <= 0
+            or metadata.num_decodes * metadata.decode_query_len != num_decode_tokens
+        ):
+            return False
+        if metadata.query_start_loc.shape[0] != metadata.block_table.shape[0] + 1:
+            return False
+        return metadata.visible_blocks.shape[0] >= num_rows
+
     def _select(
         self,
         q: torch.Tensor,
@@ -261,6 +295,28 @@ class QSAIndexer(nn.Module):
     ) -> torch.Tensor:
         from .ops.qsa import qsa_select_paged_tokens
 
+        num_rows = q.shape[0]
+        if _QSA_INDEXER_SPLIT and self._can_split(metadata, num_rows):
+            from .ops.qsa_indexer import qsa_select_paged_tokens_split
+
+            return qsa_select_paged_tokens_split(
+                q,
+                self.compressed_key_cache.kv_cache,
+                metadata.block_table,
+                metadata.token_to_req[:num_rows],
+                metadata.logical_positions[:num_rows],
+                metadata.seq_lens,
+                metadata.query_start_loc,
+                metadata.visible_blocks[:num_rows],
+                self.token_topk,
+                self.compress_ratio,
+                num_decodes=metadata.num_decodes,
+                num_decode_tokens=metadata.num_decode_tokens,
+                decode_query_len=metadata.decode_query_len,
+                max_query_len=metadata.max_query_len,
+                max_seq_len=metadata.max_seq_len,
+                out=out,
+            )
         return qsa_select_paged_tokens(
             q,
             self.compressed_key_cache.kv_cache,
