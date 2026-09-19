@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import Any
 
+import os
 import torch
 import torch.nn as nn
 
@@ -134,6 +135,11 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
 
         # PIECEWISE cudagraphs are not supported for draft decodes.
         if cudagraph_mode.decode_mode() == CUDAGraphMode.FULL:
+            cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
+        elif os.getenv("VLLM_DRAFT_DECODE_FULL_GRAPH", "0") == "1":
+            # Lab: the target runs PIECEWISE only because of its eager Engram
+            # gather; the drafter has no such op, so its decode passes can be
+            # full graphs instead of eager (measured 12.3 ms/step eager).
             cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
         else:
             cudagraph_mode = CUDAGraphMode.NONE
