@@ -179,7 +179,14 @@ class Rdna3WNA16Experts(mk.FusedMoEExpertsModular):
         act_out = scratch[rows * gate_up : rows * (gate_up + act_n)].view(rows, act_n)
 
         # BLOCK_SIZE_M=1 for decode (no padding waste), 4 for prefill.
-        block_size_m = 1 if M <= 4 else 4
+        # VLLM_MOE_RDNA3_BLOCK_M_DECODE / _PREFILL override for sweeps; the
+        # kernel accepts 1, 2, 4 or 8.
+        import os as _os
+
+        if M <= 4:
+            block_size_m = int(_os.environ.get("VLLM_MOE_RDNA3_BLOCK_M_DECODE", "1"))
+        else:
+            block_size_m = int(_os.environ.get("VLLM_MOE_RDNA3_BLOCK_M_PREFILL", "4"))
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
             topk_ids,
             block_size_m,

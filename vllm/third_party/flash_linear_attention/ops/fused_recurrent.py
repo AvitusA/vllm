@@ -14,6 +14,22 @@ from vllm.triton_utils import tl, triton
 
 from .op import exp, log
 
+import os
+
+
+def _fla_env_int(name: str, default: int) -> int:
+    """gfx1100 launch tuning for the GDN recurrent kernels.
+
+    For Qwen4Exp at TP4 the decode grid is (NV=V/BV, B*HV) = (4, 12) = 48
+    workgroups of ONE wave32 each on a 96-CU card, i.e. badly under-occupied.
+    VLLM_FLA_BV lowers the value block (more programs), VLLM_FLA_WARPS and
+    VLLM_FLA_STAGES tune each program. Defaults reproduce upstream exactly.
+    """
+    try:
+        return int(os.environ[name])
+    except (KeyError, ValueError):
+        return default
+
 
 @triton.heuristics(
     {
@@ -192,11 +208,11 @@ def fused_recurrent_gated_delta_rule_fwd(
     B, T, H, K, V = *k.shape, v.shape[-1]
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
-    BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
+    BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), _fla_env_int("VLLM_FLA_BV", 32))
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
-    num_stages = 3
-    num_warps = 1
+    num_stages = _fla_env_int("VLLM_FLA_STAGES", 3)
+    num_warps = _fla_env_int("VLLM_FLA_WARPS", 1)
 
     o = q.new_empty(NK, *v.shape)
     if inplace_final_state:
@@ -438,9 +454,9 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         raise ValueError(
             f"Packed decode kernel only supports NK=1 (got K={K}, BK={BK})."
         )
-    BV = min(triton.next_power_of_2(V), 32)
-    num_stages = 3
-    num_warps = 1
+    BV = min(triton.next_power_of_2(V), _fla_env_int("VLLM_FLA_BV", 32))
+    num_stages = _fla_env_int("VLLM_FLA_STAGES", 3)
+    num_warps = _fla_env_int("VLLM_FLA_WARPS", 1)
 
     stride_mixed_qkv_tok = mixed_qkv.stride(0)
     stride_a_tok = a.stride(0)
