@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Utilities for downloading and initializing model weights."""
 
+import re
+import functools
 import asyncio
 import concurrent.futures
 import fnmatch
@@ -610,7 +612,7 @@ def download_safetensors_index_file_from_hf(
 # So, we use the index_file to
 # look up which safetensors files should be used.
 def filter_duplicate_safetensors_files(
-    hf_weights_files: list[str], hf_folder: str, index_file: str
+    hf_weights_files: list[str], hf_folder: str, index_file: str, strict: bool = True
 ) -> list[str]:
     # model.safetensors.index.json is a mapping from keys in the
     # torch state_dict to safetensors file holding that weight.
@@ -629,7 +631,9 @@ def filter_duplicate_safetensors_files(
     # Raise error if any file is missing.
     hf_weights_files_set = set(hf_weights_files)
     missing_files = weight_files_in_index - hf_weights_files_set
-    if missing_files:
+    # strict=False: the caller deliberately restricted the file set
+    # (allow_patterns_overrides), so index files outside it are expected.
+    if missing_files and strict:
         raise FileNotFoundError(
             f"Weight files referenced in index but missing: {missing_files}"
         )
@@ -793,6 +797,55 @@ def _prefetch_checkpoint(
             pass
 
 
+_PREFETCH_EXCLUDE_RE = os.getenv(
+    "VLLM_SAFETENSORS_PREFETCH_EXCLUDE_RE",
+    r"\.ngram_embedding\.shard_\d+\.weight$",
+)
+
+
+@functools.lru_cache(maxsize=None)
+def _safetensors_tensor_names(path: str) -> tuple[str, ...]:
+    """Tensor names from a safetensors header (8-byte LE length + JSON)."""
+    with open(path, "rb") as f:
+        n = int.from_bytes(f.read(8), "little")
+        header = json.loads(f.read(n))
+    return tuple(k for k in header if k != "__metadata__")
+
+
+_PREFETCHED_FILES: set[str] = set()
+
+
+def _prefetch_candidates(sorted_files: list[str]) -> list[str]:
+    # Prefetch each file at most once per process: the drafter load iterates
+    # the same checkpoint again and would re-stream 65 GiB of weight shards,
+    # evicting the Engram table that was just prewarmed.
+    if os.getenv("VLLM_SAFETENSORS_PREFETCH_ONCE", "1") == "1":
+        fresh = [f for f in sorted_files if f not in _PREFETCHED_FILES]
+        if len(fresh) < len(sorted_files):
+            logger.info("safetensors prefetch: skipping %d already-prefetched files",
+                        len(sorted_files) - len(fresh))
+        sorted_files = fresh
+        _PREFETCHED_FILES.update(sorted_files)
+    if not _PREFETCH_EXCLUDE_RE:
+        return sorted_files
+    pat = re.compile(_PREFETCH_EXCLUDE_RE)
+    keep = []
+    for path in sorted_files:
+        try:
+            names = _safetensors_tensor_names(path)
+        except Exception:
+            keep.append(path)
+            continue
+        if names and all(pat.search(n) for n in names):
+            logger.info_once(
+                "safetensors prefetch: skipping %s (all %d tensors match %s)",
+                os.path.basename(path), len(names), _PREFETCH_EXCLUDE_RE,
+            )
+            continue
+        keep.append(path)
+    return keep
+
+
 def _prefetch_all_checkpoints(
     sorted_files: list[str],
     num_prefetch_threads: int = DEFAULT_SAFETENSORS_PREFETCH_NUM_THREADS,
@@ -876,6 +929,7 @@ def safetensors_weights_iterator(
     *,
     safetensors_prefetch_num_threads: int = DEFAULT_SAFETENSORS_PREFETCH_NUM_THREADS,
     safetensors_prefetch_block_size: int = DEFAULT_SAFETENSORS_PREFETCH_BLOCK_SIZE,
+    name_filter: Callable[[str], bool] | None = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files.
 
@@ -947,8 +1001,13 @@ def safetensors_weights_iterator(
         )
 
     if should_prefetch:
+        # Files whose EVERY tensor matches VLLM_SAFETENSORS_PREFETCH_EXCLUDE_RE
+        # are not streamed into the page cache: the 95 GiB Engram table shard
+        # is served by mmap (ple_mmap) and prewarmed separately, and pulling it
+        # through prefetch on every load evicts the weights being loaded.
+        prefetch_files = _prefetch_candidates(sorted_files)
         _prefetch_all_checkpoints(
-            sorted_files,
+            prefetch_files,
             num_prefetch_threads=safetensors_prefetch_num_threads,
             block_size=safetensors_prefetch_block_size,
         )
@@ -999,6 +1058,11 @@ def safetensors_weights_iterator(
         else:
             with safe_open(st_file, framework="pt") as f:
                 for name in f.keys():  # noqa: SIM118
+                    # get_tensor READS the tensor bytes (measured: a full shard
+                    # lands in the page cache); skip names the model will
+                    # discard anyway, e.g. the drafter walking the 160 GiB target.
+                    if name_filter is not None and not name_filter(name):
+                        continue
                     if should_skip_weight(name, local_expert_ids):
                         continue
                     param = f.get_tensor(name)

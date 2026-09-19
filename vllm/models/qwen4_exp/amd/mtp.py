@@ -395,6 +395,10 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         return loader.load_weights(weights, mapper=mapper)
 
 
+def _mtp_checkpoint_name_filter(name: str) -> bool:
+    return _remap_mtp_weight_name(name) is not None
+
+
 @support_torch_compile(
     dynamic_arg_dims={
         "input_ids": 0,
@@ -420,6 +424,10 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         config: Qwen4ExpTextConfig = vllm_config.model_config.hf_text_config
         self.vllm_config = vllm_config
+        # Never materialise target-model tensors: the loader's get_tensor reads
+        # the bytes, so a filter-less pass over the 160 GiB checkpoint evicts the
+        # prewarmed Engram table. Exactly the names load_weights would keep.
+        self.checkpoint_name_filter = _mtp_checkpoint_name_filter
         cache_config = vllm_config.cache_config
         if cache_config.mamba_cache_mode == "all":
             raise NotImplementedError(

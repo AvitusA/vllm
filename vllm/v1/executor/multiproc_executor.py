@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import concurrent.futures
 import multiprocessing
 import os
 import pickle
@@ -186,7 +187,35 @@ class MultiprocExecutor(Executor):
 
             # For CPU backend only, to setup OpenMP threads affinity
             cpu_omp_manager = OMPProcessManager(self.vllm_config)
-            for local_rank in range(self.local_world_size):
+            parallel_spawn = (
+                inherited_fds is None
+                and not current_platform.is_cpu()
+                and os.getenv("VLLM_PARALLEL_WORKER_SPAWN", "1") == "1"
+            )
+            if parallel_spawn:
+                # Under the spawn start method proc.start() blocks until the
+                # child has re-imported vllm (the pickled config exceeds the
+                # pipe buffer), ~7 s per worker in series. Spawning from
+                # threads overlaps those imports (set_spawning_popen is
+                # thread-local; no fds are inherited under spawn).
+                def _make(local_rank: int):
+                    global_rank = global_start_rank + local_rank
+                    return WorkerProc.make_worker_process(
+                        vllm_config=self.vllm_config,
+                        local_rank=local_rank,
+                        rank=global_rank,
+                        distributed_init_method=distributed_init_method,
+                        input_shm_handle=scheduler_output_handle,
+                        shared_worker_lock=shared_worker_lock,
+                        is_driver_worker=self._is_driver_worker(global_rank),
+                        inherited_fds=None,
+                    )
+
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=self.local_world_size
+                ) as pool:
+                    unready_workers = list(pool.map(_make, range(self.local_world_size)))
+            for local_rank in range(0 if parallel_spawn else self.local_world_size):
                 global_rank = global_start_rank + local_rank
                 is_driver_worker = self._is_driver_worker(global_rank)
                 with cpu_omp_manager.configure_omp_envs(

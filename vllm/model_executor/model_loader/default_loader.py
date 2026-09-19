@@ -4,7 +4,7 @@ import dataclasses
 import glob
 import os
 import time
-from collections.abc import Generator, Iterable
+from collections.abc import Callable, Generator, Iterable
 from typing import cast
 
 import torch
@@ -66,6 +66,9 @@ class DefaultModelLoader(BaseModelLoader):
         """Whether .pt weights can be used."""
 
         allow_patterns_overrides: list[str] | None = None
+        """Optional predicate on checkpoint tensor names; names it rejects are
+        never materialised (safetensors get_tensor reads the bytes)."""
+        name_filter: Callable[[str], bool] | None = None
         """If defined, weights will load exclusively using these patterns."""
 
     counter_before_loading_weights: float = 0.0
@@ -229,7 +232,8 @@ class DefaultModelLoader(BaseModelLoader):
                     revision=revision,
                 )
             hf_weights_files = filter_duplicate_safetensors_files(
-                hf_weights_files, hf_folder, index_file
+                hf_weights_files, hf_folder, index_file,
+                strict=allow_patterns_overrides is None,
             )
         else:
             hf_weights_files = filter_files_not_needed_for_inference(hf_weights_files)
@@ -295,6 +299,7 @@ class DefaultModelLoader(BaseModelLoader):
                         safetensors_prefetch_block_size=(
                             self.load_config.safetensors_prefetch_block_size
                         ),
+                        name_filter=source.name_filter,
                     )
         else:
             if extra_config.get("enable_multithread_load"):
@@ -329,6 +334,7 @@ class DefaultModelLoader(BaseModelLoader):
             prefix="",
             fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
             allow_patterns_overrides=getattr(model, "allow_patterns_overrides", None),
+            name_filter=getattr(model, "checkpoint_name_filter", None),
         )
         yield from self._get_weights_iterator(primary_weights)
 

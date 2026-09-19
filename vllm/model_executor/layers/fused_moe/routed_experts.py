@@ -5,6 +5,7 @@ from collections.abc import Callable, Iterable
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Literal, cast, overload
 
+import re
 import torch
 
 from vllm.distributed.eplb.eplb_state import EplbState
@@ -34,6 +35,8 @@ if TYPE_CHECKING:
 
 
 logger = init_logger(__name__)
+
+_EXPERT_ID_RE = re.compile(r"experts\.(\d+)\.")
 
 
 class FusedMoeWeightScaleSupported(Enum):
@@ -889,12 +892,26 @@ class RoutedExperts(PluggableLayer):
         self, weights: Iterable[tuple[str, torch.Tensor]]
     ) -> Iterable[str]:
         expert_mapping = self.get_expert_mapping(include_fused=True)
+        # Index the mapping by expert id so a per-expert checkpoint tensor only
+        # scans its own expert's entries (+ id-less ones) instead of all ~1.5k:
+        # the full linear scan cost ~85 us per tensor, ~19 s per rank for a
+        # 512-expert x 48-layer checkpoint. Fused (3D) tensors keep the scan.
+        by_expert_id: dict[str, list] = {}
+        generic_entries: list = []
+        for entry in expert_mapping:
+            m = _EXPERT_ID_RE.search(entry[1])
+            (by_expert_id.setdefault(m.group(1), []) if m else generic_entries).append(entry)
         for expert_name, loaded_weight in weights:
             qual_name = f"{self.layer_name}.{expert_name}"
             # Fused expert weights can be identified by their 3D tensors
             is_fused = loaded_weight.dim() == 3
             matched = False
-            for param_name, weight_name, expert_id, shard_id in expert_mapping:
+            m = None if is_fused else _EXPERT_ID_RE.search(qual_name)
+            candidates = (
+                by_expert_id.get(m.group(1), []) + generic_entries
+                if m is not None else expert_mapping
+            )
+            for param_name, weight_name, expert_id, shard_id in candidates:
                 if weight_name not in qual_name:
                     if matched and is_fused:
                         break

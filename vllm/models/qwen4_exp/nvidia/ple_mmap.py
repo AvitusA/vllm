@@ -55,6 +55,7 @@ import functools
 import glob
 import json
 import math
+import concurrent.futures
 import os
 import struct
 import time
@@ -105,8 +106,8 @@ _SCALE_TORCH_DTYPES: dict[str, torch.dtype] = {
     "F16": torch.float16,
 }
 _MAX_HEADER_BYTES = 100 << 20  # 100 MB
-_PREWARM_HEADROOM_BYTES = 8 << 30  # 8 GiB
-_LOG_INTERVAL_S = 60.0
+_PREWARM_HEADROOM_BYTES = int(float(os.getenv("VLLM_PLE_MMAP_PREWARM_HEADROOM_GIB", "8")) * (1 << 30))
+_LOG_INTERVAL_S = float(os.getenv("VLLM_PLE_MMAP_LOG_INTERVAL_S", "60.0"))
 _HAS_POSIX_FADVISE = hasattr(os, "posix_fadvise")
 
 _SHARD_RE = re.compile(
@@ -671,42 +672,82 @@ class MmapPleTable:
         self._rows_since_log = 0
         self._last_log = now
 
-    def prewarm(self, max_bytes: int) -> int:
-        """Stream up to ``max_bytes`` of the table into the page cache.
+    def drop_weight_pages(self) -> int:
+        """posix_fadvise(DONTNEED) every non-table safetensors file next to the
+        table shards, so the weights just streamed through the page cache stop
+        competing with the table for it. Clean, unmapped pages only: anything a
+        loader still has mapped is skipped by the kernel."""
+        if not _HAS_POSIX_FADVISE:
+            return 0
+        table_files = {mm.filename for mm in self.mm if mm is not None}
+        dropped = 0
+        for path in glob.glob(os.path.join(self.model_path, "*.safetensors")):
+            if path in table_files:
+                continue
+            try:
+                fd = os.open(path, os.O_RDONLY)
+                try:
+                    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                    dropped += os.fstat(fd).st_size
+                finally:
+                    os.close(fd)
+            except OSError:
+                pass
+        return dropped
 
-        Args:
-            max_bytes: byte budget; a non-positive value skips prewarm.
+    def prewarm(
+        self,
+        max_bytes: int,
+        rank: int = 0,
+        world_size: int = 1,
+        threads: int = 8,
+    ) -> int:
+        """Stream this rank's 1/world_size slice of the first ``max_bytes`` of
+        the table into the page cache with ``threads`` parallel pread workers.
+        All ranks share one page cache, so the table is read once in total.
 
-        Returns:
-            Bytes actually read.
+        Returns bytes read by this rank.
         """
         if max_bytes <= 0:
             return 0
-        block = 64 << 20
-        remaining = max_bytes
-        read_total = 0
+        ranges: list[tuple[str, int, int]] = []
         for mm in self.mm:
-            if mm is None or remaining <= 0:
+            if mm is None:
                 continue
-            path = mm.filename
-            if path is None:
-                # Every memmap here was opened from a path string in
-                # __init__; None only occurs for an anonymous mmap, which
-                # this class never creates.
+            if mm.filename is None:
                 raise RuntimeError("PLE mmap: memmap has no backing file")
-            start = mm.offset
-            end = start + mm.shape[0] * mm.shape[1]
-            with open(path, "rb", buffering=0) as f:
-                f.seek(start)
-                pos = start
-                while pos < end and remaining > 0:
-                    chunk = f.read(min(block, end - pos, remaining))
+            ranges.append((mm.filename, mm.offset, mm.offset + mm.shape[0] * mm.shape[1]))
+        total = sum(e - s for _p, s, e in ranges)
+        cap = min(total, max_bytes)
+        lo, hi = cap * rank // world_size, cap * (rank + 1) // world_size
+        block = 64 << 20
+        tasks: list[tuple[str, int, int]] = []
+        pos = 0
+        for path, s, e in ranges:
+            a, b = max(lo, pos), min(hi, pos + (e - s))
+            off = s + (a - pos)
+            while a < b:
+                ln = min(block, b - a)
+                tasks.append((path, off, ln))
+                a += ln
+                off += ln
+            pos += e - s
+        fds = {path: os.open(path, os.O_RDONLY) for path, _s, _e in ranges}
+        try:
+            def run(task: tuple[str, int, int]) -> int:
+                path, off, ln = task
+                got = 0
+                while got < ln:
+                    chunk = os.pread(fds[path], min(ln - got, 16 << 20), off + got)
                     if not chunk:
                         break
-                    pos += len(chunk)
-                    remaining -= len(chunk)
-                    read_total += len(chunk)
-        return read_total
+                    got += len(chunk)
+                return got
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, threads)) as ex:
+                return sum(ex.map(run, tasks))
+        finally:
+            for fd in fds.values():
+                os.close(fd)
 
     def close(self) -> None:
         """Release the gather thread pool, readahead fds, and memmaps.
@@ -1237,13 +1278,25 @@ def _attach_table(
         table_bytes = table.rows_total * row_bytes
 
         if envs.VLLM_PLE_MMAP_PREWARM:
+            try:
+                from vllm.distributed.parallel_state import (
+                    get_tensor_model_parallel_rank,
+                    get_tensor_model_parallel_world_size,
+                )
+                tp_rank = get_tensor_model_parallel_rank()
+                tp_size = get_tensor_model_parallel_world_size()
+            except Exception:
+                tp_rank, tp_size = 0, 1
+            t0 = time.monotonic()
+            dropped = table.drop_weight_pages() if os.getenv("VLLM_PLE_MMAP_DROP_WEIGHTS", "1") == "1" else 0
             bound = compute_prewarm_bound(table_bytes, _mem_available_bytes())
-            read = table.prewarm(bound)
+            read = table.prewarm(bound, rank=tp_rank, world_size=tp_size,
+                                 threads=int(os.getenv("VLLM_PLE_MMAP_PREWARM_THREADS", "8")))
             logger.info(
-                "PLE mmap: layer %d prewarm read %.2f GiB (budget %.2f GiB)",
-                layer_idx,
-                read / (1 << 30),
-                bound / (1 << 30),
+                "PLE mmap: layer %d prewarm rank %d/%d read %.2f GiB (budget %.2f GiB, "
+                "dropped %.1f GiB of weight pages) in %.1f s",
+                layer_idx, tp_rank, tp_size, read / (1 << 30), bound / (1 << 30),
+                dropped / (1 << 30), time.monotonic() - t0,
             )
 
         embedding.table = table
